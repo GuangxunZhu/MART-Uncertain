@@ -25,10 +25,13 @@ class NBADataset(Dataset):
 
         if mode == 'train':
             self.trajs = self.trajs[:32500]
+            self.index_offset = 0
         elif mode == 'val':
             self.trajs = self.trajs[32500:37500]
+            self.index_offset = 0
         else:
             self.trajs = self.trajs[:12500]
+            self.index_offset = 0
 
         self.traj_abs = torch.from_numpy(self.trajs).type(torch.float)
         self.traj_abs = self.traj_abs.permute(0, 2, 1, 3)
@@ -40,5 +43,5 @@ class NBADataset(Dataset):
         past_traj = self.traj_abs[index, :, :self.obs_len, :]
         future_traj = self.traj_abs[index, :, self.obs_len:, :]
         out = [past_traj, future_traj]
-        
-        return out
+        sample_id = index + self.index_offset
+        return out, sample_id
