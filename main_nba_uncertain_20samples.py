@@ -15,13 +15,15 @@ from models.mart import UNCERTAINMARTREASONING as MART
 from loaders.dataloader_nba import NBADataset
 import torch
 import torch.nn.functional as F
+
+
 def compute_loss(
     y_pred,
     target,
-    edge_uncertainty,
-    lambda_nll=0.1,
-    min_var=1e-4,
-    max_var=1e3
+    aux,
+    lambda_edge=0.1,
+    max_perturb_ratio=0.1,
+    gamma=5.0
 ):
     if target.dim() == 5 and target.size(2) == 1:
         target = target.squeeze(2)
@@ -33,211 +35,247 @@ def compute_loss(
 
     B, N, S, K, T, _ = y_pred.shape
 
-    # ============================================================
-    # 1. Prediction loss: Best-of-S
-    # ============================================================
+    edge_uncertainty = aux["edge_uncertainty"]
+
+    # ==================================================
+    # 1. Best-of-S prediction loss
+    # ==================================================
 
     target_expand = target.unsqueeze(2).unsqueeze(3)
+
     displacement_error = torch.norm(
         y_pred - target_expand,
         dim=-1
-    )                                           # [B,N,S,K,T]
+    )
+    # [B,N,S,K,T]
 
-    decoder_ade = displacement_error.mean(
-        dim=4
-    )                                           # [B,N,S,K]
+    decoder_ade = displacement_error.mean(dim=4)
+    # [B,N,S,K]
 
-    best_decoder_ade_per_sample, best_decoder_idx = decoder_ade.min(
-        dim=3
-    )                                           # [B,N,S]
+    best_decoder_ade_per_sample, best_decoder_idx = (
+        decoder_ade.min(dim=3)
+    )
+    # [B,N,S]
 
-    best_sample_ade, best_sample_idx = best_decoder_ade_per_sample.min(
-        dim=2
-    )                                           # [B,N]
+    best_sample_ade, best_sample_idx = (
+        best_decoder_ade_per_sample.min(dim=2)
+    )
+    # [B,N]
 
     loss_pred = best_sample_ade.mean()
 
-    # ============================================================
-    # 2. Edge uncertainty
-    # ============================================================
+    # ==================================================
+    # 2. Edge perturbation constraint
+    # ==================================================
 
-    mu_edge = edge_uncertainty[
-        "mu_edge"
-    ]                                           # [B,N,N,D]
+    sampled_edges = edge_uncertainty["sampled_edges"]
+    # [B,N,N,S,D]
 
-    total_var_edge = edge_uncertainty[
-        "total_var_edge"
-    ]                                           # [B,N,N,D]
+    mu_edge = edge_uncertainty["mu_edge"]
+    # [B,N,N,D]
 
-    # ============================================================
-    # 3. Trajectory residual -> Pair residual
-    #
-    # detach:
-    # NLL 用 residual 作为 uncertainty calibration target，
-    # 不反向修改 prediction branch
-    # ============================================================
+    delta_edge = (
+        sampled_edges
+        - mu_edge.unsqueeze(3)
+    )
 
-    agent_residual = best_sample_ade.detach().pow(
-        2
-    )                                           # [B,N]
-    # # K=1 current setting
-    # mean_pred = y_pred.mean(dim=2).mean(dim=2)
-    # # [B,N,T,2]
-
-    # mean_ade = torch.norm(
-    #     mean_pred - target,
-    #     dim=-1
-    # ).mean(dim=-1)
-    # # [B,N]
-
-    # agent_residual = mean_ade.detach().pow(2)
-
-    # pair_residual = 0.5 * (
-    #     agent_residual.unsqueeze(2)
-    #     + agent_residual.unsqueeze(1)
-    # )
-
-    pair_residual = 0.5 * (
-        agent_residual.unsqueeze(2)
-        + agent_residual.unsqueeze(1)
-    )                                           # [B,N,N]
-
-    # ============================================================
-    # 4. Edge variance
-    # ============================================================
-
-    edge_var_pair = total_var_edge.mean(
-        dim=-1
-    ).clamp(
-        min=min_var,
-        max=max_var
-    )                                           # [B,N,N]
+    perturb_ratio = (
+        delta_edge.norm(dim=-1)
+        /
+        mu_edge.detach()
+        .norm(dim=-1)
+        .unsqueeze(3)
+        .clamp_min(1e-2)
+    )
+    # [B,N,N,S]
 
     edge_mask = ~torch.eye(
         N,
         dtype=torch.bool,
-        device=mu_edge.device
-    ).unsqueeze(0)
-
-    edge_mask = edge_mask.expand(
-        B,
-        N,
-        N
+        device=y_pred.device
     )
 
-    # ============================================================
-    # 5. Gaussian NLL
-    #
-    # 0.5 * (r / var + log(var))
-    # ============================================================
-
-    edge_nll = 0.5 * (
-        pair_residual / edge_var_pair
-        + torch.log(edge_var_pair)
+    edge_mask_s = edge_mask[
+        None, :, :, None
+    ].expand(
+        B, N, N, S
     )
 
-    loss_edge_nll = edge_nll[
-        edge_mask
-    ].mean()
+    valid_ratio = perturb_ratio[
+        edge_mask_s
+    ]
 
-    loss_nll = lambda_nll * loss_edge_nll
+    excess = F.relu(
+        valid_ratio - max_perturb_ratio
+    )
 
-    # ============================================================
-    # 6. Monitoring: variance
-    # ============================================================
+    loss_edge_reg = (
+        torch.exp(gamma * excess) - 1.0
+    ).mean()
 
-    edge_var = edge_var_pair[
-        edge_mask
-    ].mean()
+    # ==================================================
+    # 3. Epistemic variance
+    # ==================================================
 
-    # ============================================================
-    # 7. Monitoring: trajectory variance across S
+    U_e_edge = edge_uncertainty["U_e_edge"]
+    # [B,N,N,D]
+
+    edge_mask_u = edge_mask[
+        None, :, :
+    ].expand(
+        B, N, N
+    )
+
+    epistemic_var = (
+        U_e_edge.mean(dim=-1)[edge_mask_u]
+        .mean()
+    )
+
+    # ==================================================
+    # 4. SampleEdgeVar
     #
-    # 每个 interaction sample 先选自己的 best decoder
-    # ============================================================
+    # sampled edge BEFORE RT
+    # [B,N,N,S,D]
+    # ==================================================
+
+    pair_reasoning_edges = aux[
+        "pair_reasoning_edges"
+    ]
+
+    sample_edge_var_map = (
+        pair_reasoning_edges.var(
+            dim=3,
+            unbiased=False
+        ).mean(dim=-1)
+    )
+    # [B,N,N]
+
+    sample_edge_var = (
+        sample_edge_var_map[edge_mask_u]
+        .mean()
+    )
+
+    # ==================================================
+    # 5. PairEdgeVar
+    #
+    # pair edge AFTER RT
+    # [B,N,N,S,D]
+    # ==================================================
+
+    e_pair_stack = aux[
+        "e_pair_stack"
+    ]
+
+    pair_edge_var_map = (
+        e_pair_stack.var(
+            dim=3,
+            unbiased=False
+        ).mean(dim=-1)
+    )
+    # [B,N,N]
+
+    pair_edge_var = (
+        pair_edge_var_map[edge_mask_u]
+        .mean()
+    )
+
+    # ==================================================
+    # 6. PairNodeVar
+    #
+    # pair node AFTER RT
+    # [B,N,S,D]
+    # ==================================================
+
+    n_pair_stack = aux[
+        "n_pair_stack"
+    ]
+
+    pair_node_var = (
+        n_pair_stack.var(
+            dim=2,
+            unbiased=False
+        ).mean()
+    )
+
+    # ==================================================
+    # 7. Trajectory PredVar
+    # ==================================================
 
     best_decoder_idx_expand = best_decoder_idx[
         :, :, :, None, None, None
     ].expand(
-        B,
-        N,
-        S,
-        1,
-        T,
-        2
+        B, N, S, 1, T, 2
     )
 
     best_pred_per_sample = torch.gather(
         y_pred,
         dim=3,
         index=best_decoder_idx_expand
-    ).squeeze(
-        3
-    )                                           # [B,N,S,T,2]
+    ).squeeze(3)
+    # [B,N,S,T,2]
 
-    pred_var = best_pred_per_sample.var(
-        dim=2,
-        unbiased=False
-    ).mean()
+    pred_var = (
+        best_pred_per_sample.var(
+            dim=2,
+            unbiased=False
+        ).mean()
+    )
 
-    # ============================================================
-    # 8. Monitoring: sample diversity / Best-of-S gain
-    # ============================================================
+    # ==================================================
+    # 8. Best-of-S monitoring
+    # ==================================================
 
-    sample_ade_mean = best_decoder_ade_per_sample.mean()
+    sample_ade_mean = (
+        best_decoder_ade_per_sample.mean()
+    )
 
     best_sample_gain = (
         sample_ade_mean
         - best_sample_ade.mean()
     )
 
-    # ============================================================
-    # 9. Extra uncertainty statistics
-    # ============================================================
-
-    U_e_edge = edge_uncertainty[
-        "U_e_edge"
-    ]
-
-    U_a_edge = edge_uncertainty[
-        "U_a_edge"
-    ]
-
-    epistemic_var = U_e_edge.mean(
-        dim=-1
-    )[edge_mask].mean()
-
-    aleatoric_var = U_a_edge.mean(
-        dim=-1
-    )[edge_mask].mean()
-
-    # ============================================================
-    # 10. Total loss
-    # ============================================================
+    # ==================================================
+    # 9. Total loss
+    # ==================================================
 
     total_loss = (
         loss_pred
-        + loss_nll
+        + lambda_edge * loss_edge_reg
     )
 
     loss_dict = {
-        "loss_pred": loss_pred.detach(),
-        "loss_edge_nll": loss_edge_nll.detach(),
-        "loss_nll": loss_nll.detach(),
+        "loss_pred":
+            loss_pred.detach(),
 
-        "edge_var": edge_var.detach(),
-        "epistemic_var": epistemic_var.detach(),
-        "aleatoric_var": aleatoric_var.detach(),
+        "loss_edge_reg":
+            loss_edge_reg.detach(),
 
-        "pair_residual": pair_residual[
-            edge_mask
-        ].mean().detach(),
+        "epistemic_var":
+            epistemic_var.detach(),
 
-        "pred_var": pred_var.detach(),
+        "perturb_ratio":
+            valid_ratio.mean().detach(),
 
-        "sample_ade_mean": sample_ade_mean.detach(),
-        "best_sample_ade": best_sample_ade.mean().detach(),
-        "best_sample_gain": best_sample_gain.detach()
+        "sample_edge_var":
+            sample_edge_var.detach(),
+
+        "pair_edge_var":
+            pair_edge_var.detach(),
+
+        "pair_node_var":
+            pair_node_var.detach(),
+
+        "pred_var":
+            pred_var.detach(),
+
+        "sample_ade_mean":
+            sample_ade_mean.detach(),
+
+        "best_sample_ade":
+            best_sample_ade.mean().detach(),
+
+        "best_sample_gain":
+            best_sample_gain.detach()
     }
 
     return total_loss, loss_dict
@@ -245,21 +283,17 @@ def compute_loss(
 def train(epoch, model, optimizer, loader):
     model.train()
 
-    # ==================================================
-    # [MODIFIED]
-    # 删除 loss_best / best_weight
-    # 增加 epistemic_var / aleatoric_var
-    # ==================================================
     avg_meter = {
-        "epoch": epoch,
         "loss": 0.0,
         "loss_pred": 0.0,
-        "loss_edge_nll": 0.0,
-        "loss_nll": 0.0,
-        "edge_var": 0.0,
+        "loss_edge_reg": 0.0,
         "epistemic_var": 0.0,
-        "aleatoric_var": 0.0,
-        "pair_residual": 0.0,
+        "perturb_ratio": 0.0,
+
+        "sample_edge_var": 0.0,
+        "pair_edge_var": 0.0,
+        "pair_node_var": 0.0,
+
         "pred_var": 0.0,
         "sample_ade_mean": 0.0,
         "best_sample_ade": 0.0,
@@ -269,22 +303,18 @@ def train(epoch, model, optimizer, loader):
 
     loader_len = len(loader)
 
-    for i, (data, sample_ids) in enumerate(loader):
+    for i, (data, _) in enumerate(loader):
         optimizer.zero_grad()
 
         x_abs, y = data
         x_abs, y = x_abs.cuda(), y.cuda()
 
-        batch_size, num_agents, _, _ = x_abs.size()
+        B, N, _, _ = x_abs.shape
 
         x_rel = torch.zeros_like(x_abs)
         x_rel[:, :, 1:] = x_abs[:, :, 1:] - x_abs[:, :, :-1]
         x_rel[:, :, 0] = x_rel[:, :, 1]
 
-        # ==================================================
-        # Model output:
-        # y_pred [B,N,S,K,T,2]
-        # ==================================================
         y_pred, aux = model(
             x_abs,
             x_rel,
@@ -293,26 +323,15 @@ def train(epoch, model, optimizer, loader):
 
         if opts.pred_rel:
             cur_pos = x_abs[:, :, -1:, :2].unsqueeze(2).unsqueeze(3)
-            y_pred = torch.cumsum(
-                y_pred,
-                dim=4
-            ) + cur_pos
+            y_pred = torch.cumsum(y_pred, dim=4) + cur_pos
 
-        # ==================================================
-        # [MODIFIED]
-        # 当前 loss:
-        # L = L_pred + lambda_nll * L_edge_nll
-        # ==================================================
         total_loss, loss_dict = compute_loss(
             y_pred=y_pred,
             target=y,
-            edge_uncertainty=aux["edge_uncertainty"],
-
-            # 建议先从 0.01 开始
-            lambda_nll=0.01,
-
-            min_var=1e-4,
-            max_var=1e3
+            aux=aux,
+            lambda_edge=0.1,
+            max_perturb_ratio=0.1,
+            gamma=5.0
         )
 
         total_loss.backward()
@@ -325,101 +344,42 @@ def train(epoch, model, optimizer, loader):
 
         optimizer.step()
 
-        meter_weight = batch_size * num_agents
+        weight = B * N
 
-        avg_meter["loss"] += (
-            total_loss.item()
-            * meter_weight
-        )
+        avg_meter["loss"] += total_loss.item() * weight
 
-        avg_meter["loss_pred"] += (
-            loss_dict["loss_pred"].item()
-            * meter_weight
-        )
+        for key in [
+            "loss_pred",
+            "loss_edge_reg",
+            "epistemic_var",
+            "perturb_ratio",
 
-        avg_meter["loss_edge_nll"] += (
-            loss_dict["loss_edge_nll"].item()
-            * meter_weight
-        )
+            "sample_edge_var",
+            "pair_edge_var",
+            "pair_node_var",
 
-        avg_meter["loss_nll"] += (
-            loss_dict["loss_nll"].item()
-            * meter_weight
-        )
-
-        avg_meter["edge_var"] += (
-            loss_dict["edge_var"].item()
-            * meter_weight
-        )
-
-        # ==================================================
-        # [NEW]
-        # ==================================================
-        avg_meter["epistemic_var"] += (
-            loss_dict["epistemic_var"].item()
-            * meter_weight
-        )
-
-        avg_meter["aleatoric_var"] += (
-            loss_dict["aleatoric_var"].item()
-            * meter_weight
-        )
-
-        avg_meter["pair_residual"] += (
-            loss_dict["pair_residual"].item()
-            * meter_weight
-        )
-
-        avg_meter["pred_var"] += (
-            loss_dict["pred_var"].item()
-            * meter_weight
-        )
-
-        avg_meter["sample_ade_mean"] += (
-            loss_dict["sample_ade_mean"].item()
-            * meter_weight
-        )
-
-        avg_meter["best_sample_ade"] += (
-            loss_dict["best_sample_ade"].item()
-            * meter_weight
-        )
-
-        avg_meter["best_sample_gain"] += (
-            loss_dict["best_sample_gain"].item()
-            * meter_weight
-        )
-
-        avg_meter["counter"] += meter_weight
-
-        # ==================================================
-        # Logging
-        # ==================================================
-        if i % 100 == 0:
-            th = get_th(
-                opts,
-                model
+            "pred_var",
+            "sample_ade_mean",
+            "best_sample_ade",
+            "best_sample_gain"
+        ]:
+            avg_meter[key] += (
+                loss_dict[key].item() * weight
             )
 
-            # ==================================================
-            # [MODIFIED]
-            #
-            # 删除：
-            # Best
-            # Weight
-            #
-            # 增加：
-            # EpiVar
-            # AleaVar
-            # ==================================================
+        avg_meter["counter"] += weight
+
+        if i % 100 == 0:
+            th = get_th(opts, model)
+
             print(
                 "[{}] Epochs: {:02d}/{:02d}| It: {:04d}/{:04d} | "
-                "Loss: {:.6f} | Pred: {:.6f} | "
-                "EdgeNLL: {:.6f} | NLL: {:.6f} | "
-                "EdgeVar: {:.6f} | EpiVar: {:.6f} | AleaVar: {:.6f} | "
-                "PairResidual: {:.6f} | PredVar: {:.6f} | "
-                "SampleADEMean: {:.6f} | BestSampleADE: {:.6f} | Gain: {:.6f} | "
-                "Threshold: {} | LR: {}"
+                "Loss: {:.6f} | Pred: {:.6f} | EdgeReg: {:.6f} | "
+                "Perturb: {:.4f} | EpiVar: {:.8f} | "
+                "SampleEdgeVar: {:.8f} | PairEdgeVar: {:.8f} | "
+                "PairNodeVar: {:.8f} | PredVar: {:.6f} | "
+                "SampleADEMean: {:.6f} | BestSampleADE: {:.6f} | "
+                "Gain: {:.6f} | Threshold: {} | LR: {}"
                 .format(
                     loader.dataset.mode.upper(),
                     epoch + 1,
@@ -429,15 +389,14 @@ def train(epoch, model, optimizer, loader):
 
                     total_loss.item(),
                     loss_dict["loss_pred"].item(),
+                    loss_dict["loss_edge_reg"].item(),
 
-                    loss_dict["loss_edge_nll"].item(),
-                    loss_dict["loss_nll"].item(),
-
-                    loss_dict["edge_var"].item(),
+                    loss_dict["perturb_ratio"].item(),
                     loss_dict["epistemic_var"].item(),
-                    loss_dict["aleatoric_var"].item(),
 
-                    loss_dict["pair_residual"].item(),
+                    loss_dict["sample_edge_var"].item(),
+                    loss_dict["pair_edge_var"].item(),
+                    loss_dict["pair_node_var"].item(),
                     loss_dict["pred_var"].item(),
 
                     loss_dict["sample_ade_mean"].item(),
@@ -449,31 +408,7 @@ def train(epoch, model, optimizer, loader):
                 )
             )
 
-    # ==================================================
-    # Epoch average
-    # ==================================================
-    counter = avg_meter["counter"]
-
-    print(
-        "\n[TRAIN AVG] "
-        "Loss: {:.6f} | Pred: {:.6f} | "
-        "EdgeNLL: {:.6f} | EdgeVar: {:.6f} | "
-        "EpiVar: {:.6f} | AleaVar: {:.6f} | "
-        "PairResidual: {:.6f} | PredVar: {:.6f} | Gain: {:.6f}\n"
-        .format(
-            avg_meter["loss"] / counter,
-            avg_meter["loss_pred"] / counter,
-            avg_meter["loss_edge_nll"] / counter,
-            avg_meter["edge_var"] / counter,
-            avg_meter["epistemic_var"] / counter,
-            avg_meter["aleatoric_var"] / counter,
-            avg_meter["pair_residual"] / counter,
-            avg_meter["pred_var"] / counter,
-            avg_meter["best_sample_gain"] / counter
-        )
-    )
-
-    return avg_meter["loss"] / counter
+    return avg_meter["loss"] / avg_meter["counter"]
 
 def test(epoch, model, loader):
     model.eval()
@@ -808,6 +743,11 @@ def main():
     model = MART(
         opts
     ).cuda()
+
+    # 如果你的新模型 class 实际叫 UNCERTAINMART，
+    # 则这里改成：
+    #
+    # model = UNCERTAINMART(opts).cuda()
 
     print(
         model

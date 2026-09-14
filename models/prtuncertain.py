@@ -49,26 +49,22 @@ class MLP(nn.Module):
 
 
 # ============================================================
-
 # Pairwise Relational Transformer
-
 # ============================================================
-
 
 class RT(nn.Module):
     def __init__(
-            self,
-            num_layers=3,
-            num_heads=4,
-            node_dim=64,
-            node_hidden_dim=128,
-            edge_dim=64,
-            edge_hidden_dim_1=128,
-            edge_hidden_dim_2=128,
-            dropout=0.0
+        self,
+        num_layers=3,
+        num_heads=4,
+        node_dim=64,
+        node_hidden_dim=128,
+        edge_dim=64,
+        edge_hidden_dim_1=128,
+        edge_hidden_dim_2=128,
+        dropout=0.0
     ):
-
-        super(RT, self).__init__()
+        super().__init__()
 
         layer = RTTransformerLayer(
             num_heads,
@@ -81,28 +77,21 @@ class RT(nn.Module):
         )
 
         self.aggregation = 'cat'
+        print('[INFO] PRT Agg: {}'.format(self.aggregation))
 
-        print(
-            '[INFO] PRT Agg: {}'.format(
-                self.aggregation
-            )
-        )
-
-        self.layers = nn.ModuleList(
-            [copy.deepcopy(layer) for _ in range(num_layers)]
-        )
+        self.layers = nn.ModuleList([
+            copy.deepcopy(layer)
+            for _ in range(num_layers)
+        ])
 
         self.node2edge_mlp = MLP(
             input_dim=node_dim * 2 if self.aggregation == 'cat' else node_dim,
-            output_dim=node_dim,
+            output_dim=edge_dim,
             hidden_size=(node_hidden_dim,)
         )
 
     def init_adj(self, num_nodes, batch, device):
-
-        off_diag = np.ones(
-            [num_nodes, num_nodes]
-        )
+        off_diag = np.ones([num_nodes, num_nodes])
 
         rel_rec = np.array(
             encode_onehot(np.where(off_diag)[1]),
@@ -118,88 +107,45 @@ class RT(nn.Module):
             rel_rec,
             dtype=torch.float32,
             device=device
-        )
+        ).unsqueeze(0).repeat(batch, 1, 1)
 
         rel_send = torch.tensor(
             rel_send,
             dtype=torch.float32,
             device=device
-        )
-
-        rel_rec = rel_rec.unsqueeze(0).repeat(
-            batch,
-            1,
-            1
-        )
-
-        rel_send = rel_send.unsqueeze(0).repeat(
-            batch,
-            1,
-            1
-        )
+        ).unsqueeze(0).repeat(batch, 1, 1)
 
         return rel_rec, rel_send
 
     def init_edge(self, x, rel_rec, rel_send):
-
         B, N, _ = x.shape
 
         if self.aggregation == 'cat':
-
-            receivers = torch.matmul(
-                rel_rec,
-                x
-            )
-
-            senders = torch.matmul(
-                rel_send,
-                x
-            )
+            receivers = torch.matmul(rel_rec, x)
+            senders = torch.matmul(rel_send, x)
 
             edges = self.node2edge_mlp(
-                torch.cat(
-                    [receivers, senders],
-                    dim=-1
-                )
+                torch.cat([receivers, senders], dim=-1)
             )
 
         elif self.aggregation == 'avg':
-
             H = rel_rec + rel_send
-
             edges = self.node2edge_mlp(
                 torch.matmul(H, x) / 2
             )
 
         elif self.aggregation == 'sum':
-
             H = rel_rec + rel_send
-
             edges = self.node2edge_mlp(
                 torch.matmul(H, x)
             )
 
         else:
-
             raise NotImplementedError
 
-        edges = edges.reshape(
-            B,
-            N,
-            N,
-            -1
-        )
-
-        return edges
-
-    # ========================================================
-
-    # [NEW]
-
-    # ========================================================
+        return edges.reshape(B, N, N, -1)
 
     def build_initial_edge(self, node_features):
-
         B, N, _ = node_features.shape
 
         rel_rec, rel_send = self.init_adj(
@@ -208,35 +154,17 @@ class RT(nn.Module):
             node_features.device
         )
 
-        edge_features = self.init_edge(
+        return self.init_edge(
             node_features,
             rel_rec,
             rel_send
         )
 
-        return edge_features
-
-    # ========================================================
-
-    # [MODIFIED]
-
-    # uncertainty 传给 attention
-
-    # ========================================================
-
-    def reasoning(
-        self,
-        node_features,
-        edge_features,
-        edge_uncertainty=None
-    ):
-
+    def reasoning(self, node_features, edge_features):
         for layer in self.layers:
-
             node_features, edge_features = layer(
                 node_features,
-                edge_features,
-                edge_uncertainty
+                edge_features
             )
 
         return node_features, edge_features
@@ -247,39 +175,34 @@ class RT(nn.Module):
         edge_features_=None,
         return_edge=False
     ):
-
         edge_features = self.build_initial_edge(
             node_features
         )
 
         node_features, edge_features = self.reasoning(
             node_features,
-            edge_features,
-            edge_uncertainty=None
+            edge_features
         )
 
         if return_edge:
-
             return node_features, edge_features
 
         return node_features
 
+
 class RTNoEdgeInit(nn.Module):
-
     def __init__(
-            self,
-            num_layers=3,
-            num_heads=4,
-            node_dim=64,
-            node_hidden_dim=128,
-            edge_dim=64,
-            edge_hidden_dim_1=128,
-            edge_hidden_dim_2=128,
-            dropout=0.0
-
+        self,
+        num_layers=3,
+        num_heads=4,
+        node_dim=64,
+        node_hidden_dim=128,
+        edge_dim=64,
+        edge_hidden_dim_1=128,
+        edge_hidden_dim_2=128,
+        dropout=0.0
     ):
-
-        super(RTNoEdgeInit, self).__init__()
+        super().__init__()
 
         layer = RTTransformerLayer(
             num_heads,
@@ -291,29 +214,16 @@ class RTNoEdgeInit(nn.Module):
             dropout
         )
 
-        self.layers = nn.ModuleList(
-            [copy.deepcopy(layer) for _ in range(num_layers)]
-        )
+        self.layers = nn.ModuleList([
+            copy.deepcopy(layer)
+            for _ in range(num_layers)
+        ])
 
-    # ========================================================
-
-    # [MODIFIED]
-
-    # ========================================================
-
-    def reasoning(
-        self,
-        node_features,
-        edge_features,
-        edge_uncertainty=None
-    ):
-
+    def reasoning(self, node_features, edge_features):
         for layer in self.layers:
-
             node_features, edge_features = layer(
                 node_features,
-                edge_features,
-                edge_uncertainty
+                edge_features
             )
 
         return node_features, edge_features
@@ -323,88 +233,61 @@ class RTNoEdgeInit(nn.Module):
         node_features,
         edge_features,
         return_edge=False
-
     ):
-
         node_features, edge_features = self.reasoning(
             node_features,
-            edge_features,
-            edge_uncertainty=None
-
+            edge_features
         )
 
         if return_edge:
-
             return node_features, edge_features
 
         return node_features
 
 
 class RTTransformerLayer(nn.Module):
-
     def __init__(
-            self,
-            num_heads=4,
-            node_dim=64,
-            node_hidden_dim=128,
-            edge_dim=64,
-            edge_hidden_dim_1=128,
-            edge_hidden_dim_2=128,
-            dropout=0.0
+        self,
+        num_heads=4,
+        node_dim=64,
+        node_hidden_dim=128,
+        edge_dim=64,
+        edge_hidden_dim_1=128,
+        edge_hidden_dim_2=128,
+        dropout=0.0
     ):
-
-        super(RTTransformerLayer, self).__init__()
+        super().__init__()
 
         self.edge_update = True
+
         self.attention_layer = RTAttentionLayer(
             num_heads,
             node_dim,
             edge_dim
         )
 
-        self.dropout = nn.Dropout(
-            dropout
-        )
+        self.dropout = nn.Dropout(dropout)
 
         self.linear_net_n = nn.Sequential(
-
-            nn.Linear(
-                node_dim,
-                node_hidden_dim
-            ),
-
+            nn.Linear(node_dim, node_hidden_dim),
             nn.ReLU(inplace=True),
-
-            nn.Linear(
-                node_hidden_dim,
-                node_dim
-            )
-
+            nn.Linear(node_hidden_dim, node_dim)
         )
 
-        self.norm1_n = nn.LayerNorm(
-            node_dim
-        )
-
-        self.norm2_n = nn.LayerNorm(
-            node_dim
-        )
+        self.norm1_n = nn.LayerNorm(node_dim)
+        self.norm2_n = nn.LayerNorm(node_dim)
 
         if self.edge_update:
-
             self.linear_net1_e = nn.Sequential(
                 nn.Linear(
                     node_dim * 2 + edge_dim * 2,
                     edge_hidden_dim_1
                 ),
-
                 nn.ReLU(inplace=True),
-
                 nn.Linear(
                     edge_hidden_dim_1,
                     edge_dim
                 )
-
             )
 
             self.linear_net2_e = nn.Sequential(
@@ -412,144 +295,94 @@ class RTTransformerLayer(nn.Module):
                     edge_dim,
                     edge_hidden_dim_2
                 ),
-
                 nn.ReLU(inplace=True),
-
                 nn.Linear(
                     edge_hidden_dim_2,
                     edge_dim
                 )
-
             )
 
-            self.norm1_e = nn.LayerNorm(
-                edge_dim
-            )
+            self.norm1_e = nn.LayerNorm(edge_dim)
+            self.norm2_e = nn.LayerNorm(edge_dim)
 
-            self.norm2_e = nn.LayerNorm(
-                edge_dim
-            )
-
-    # ========================================================
-
-    # [MODIFIED]
-
-    # ========================================================
-
-    def forward(
-        self,
-        node_features,
-        edge_features,
-        edge_uncertainty=None
-    ):
-
+    def forward(self, node_features, edge_features):
         _, N, _ = node_features.shape
 
+        # ====================================================
+        # Node update
+        # ====================================================
         attn_out = self.attention_layer(
             node_features,
-            edge_features,
-            edge_uncertainty
-        )
-
-        node_features = node_features + self.dropout(
-            attn_out
+            edge_features
         )
 
         node_features = self.norm1_n(
-            node_features
+            node_features + self.dropout(attn_out)
         )
 
         linear_out = self.linear_net_n(
             node_features
         )
 
-        node_features = node_features + self.dropout(
-            linear_out
-        )
-
         node_features = self.norm2_n(
-            node_features
+            node_features + self.dropout(linear_out)
         )
 
+        # ====================================================
+        # Edge update
+        # ====================================================
         if self.edge_update:
-
-            source_nodes = node_features.unsqueeze(
-                1
+            source_nodes = node_features.unsqueeze(1).repeat(
+                1, N, 1, 1
             )
 
-            expanded_source_nodes = source_nodes.repeat(
-                1,
-                N,
-                1,
-                1
-            )
-
-            target_nodes = node_features.unsqueeze(
-                2
-            )
-
-            expanded_target_nodes = target_nodes.repeat(
-                1,
-                1,
-                N,
-                1
+            target_nodes = node_features.unsqueeze(2).repeat(
+                1, 1, N, 1
             )
 
             reversed_edge_features = edge_features.permute(
-                0,
-                2,
-                1,
-                3
+                0, 2, 1, 3
             )
 
-            concatenated_inputs = torch.cat(
+            edge_input = torch.cat(
                 [
                     edge_features,
                     reversed_edge_features,
-                    expanded_source_nodes,
-                    expanded_target_nodes
+                    source_nodes,
+                    target_nodes
                 ],
-
                 dim=-1
-
-            )
-
-            edge_features = edge_features + self.dropout(
-                self.linear_net1_e(
-                    concatenated_inputs
-                )
             )
 
             edge_features = self.norm1_e(
                 edge_features
-            )
-
-            edge_features = edge_features + self.dropout(
-                self.linear_net2_e(
-                    edge_features
+                + self.dropout(
+                    self.linear_net1_e(edge_input)
                 )
             )
 
             edge_features = self.norm2_e(
                 edge_features
+                + self.dropout(
+                    self.linear_net2_e(edge_features)
+                )
             )
 
         return node_features, edge_features
 
+
 class RTAttentionLayer(nn.Module):
-
     def __init__(
-            self,
-            num_heads,
-            node_dim,
-            edge_dim,
-            uncertainty_weight=0.1
-
+        self,
+        num_heads,
+        node_dim,
+        edge_dim
     ):
+        super().__init__()
 
-        super(RTAttentionLayer, self).__init__()
         self.num_heads = num_heads
         self.head_dim = node_dim // num_heads
+        self.scale = 1.0 / math.sqrt(self.head_dim)
 
         self.proj_qkv_n = nn.Linear(
             node_dim,
@@ -566,56 +399,22 @@ class RTAttentionLayer(nn.Module):
             node_dim
         )
 
-        self.scale = 1.0 / math.sqrt(
-            self.head_dim
-        )
-
-        # ====================================================
-
-        # [NEW]
-
-        # uncertainty penalty weight
-
-        # ====================================================
-
-        self.uncertainty_weight = uncertainty_weight
-
-    # ========================================================
-
-    # [MODIFIED]
-
-    # edge_uncertainty 加入 attention logits
-
-    # ========================================================
-
-    def forward(
-        self,
-        node_features,
-        edge_features,
-        edge_uncertainty=None
-    ):
-
+    def forward(self, node_features, edge_features):
         B, N, _ = node_features.shape
+
+        # ====================================================
+        # Node Q/K/V
+        # [B,N,D] -> [B,H,N,3Dh]
+        # ====================================================
         qkv_n = self.proj_qkv_n(
             node_features
-        )
-
-        qkv_e = self.proj_qkv_e(
-            edge_features
-        )
-
-        qkv_n = qkv_n.reshape(
+        ).reshape(
             B,
             N,
             self.num_heads,
             3 * self.head_dim
-        )
-
-        qkv_n = qkv_n.permute(
-            0,
-            2,
-            1,
-            3
+        ).permute(
+            0, 2, 1, 3
         )
 
         q_n, k_n, v_n = qkv_n.chunk(
@@ -623,21 +422,20 @@ class RTAttentionLayer(nn.Module):
             dim=-1
         )
 
-        qkv_e = qkv_e.reshape(
+        # ====================================================
+        # Edge Q/K/V
+        # [B,N,N,D] -> [B,H,N,N,3Dh]
+        # ====================================================
+        qkv_e = self.proj_qkv_e(
+            edge_features
+        ).reshape(
             B,
             N,
             N,
             self.num_heads,
             3 * self.head_dim
-        )
-
-        qkv_e = qkv_e.permute(
-            0,
-            3,
-            1,
-            2,
-            4
-
+        ).permute(
+            0, 3, 1, 2, 4
         )
 
         q_e, k_e, v_e = qkv_e.chunk(
@@ -645,183 +443,59 @@ class RTAttentionLayer(nn.Module):
             dim=-1
         )
 
+        # ====================================================
+        # Relational Q/K
+        # ====================================================
         q = (
-            q_n.reshape(
-                B,
-                self.num_heads,
-                N,
-                1,
-                self.head_dim
-            )
-
+            q_n.unsqueeze(3)
             + q_e
-
         )
 
         k = (
-            k_n.reshape(
-                B,
-                self.num_heads,
-                1,
-                N,
-                self.head_dim
-            )
-
+            k_n.unsqueeze(2)
             + k_e
-
         )
 
-        q = q.reshape(
-            B,
-            self.num_heads,
-            N,
-            N,
-            1,
-            self.head_dim
-
-        )
-
-        k = k.reshape(
-            B,
-            self.num_heads,
-            N,
-            N,
-            self.head_dim,
-            1
-        )
-
-        qk = torch.matmul(
-            q,
-            k
-        )
-
-        qk = qk.reshape(
-            B,
-            self.num_heads,
-            N,
-            N
-        )
-
-        attention_logits = (
-            qk * self.scale
-        )
-
-        # ====================================================
-
-        # [NEW]
-
-        #
-
-        # uncertainty:
-
-        # [B,N,N,D]
-
-        #
-
-        # -> scalar uncertainty:
-
-        # [B,N,N]
-
-        #
-
-        # high uncertainty
-
-        # -> lower attention logit？
-
-        # ====================================================
-
-
-        if edge_uncertainty is not None:
-            uncertainty_score = edge_uncertainty.mean(dim=-1)   # [B,N,N]
-
-            min_uncertainty = uncertainty_score.min().item()
-            max_uncertainty = uncertainty_score.max().item()
-            std_uncertainty = uncertainty_score.std().item()
-            
-            uncertainty_score = torch.log1p(uncertainty_score)
-
-            unc_mean = uncertainty_score.mean(
-                dim=-1,
-                keepdim=True
-            )
-
-            unc_std = uncertainty_score.std(
-                dim=-1,
-                keepdim=True,
-                unbiased=False
-            )
-
-            normalized_uncertainty = torch.where(
-                unc_std > 1e-3,
-                (uncertainty_score - uncertainty_score.mean(dim=-1, keepdim=True))
-                / (unc_std + 1e-6),
-                torch.zeros_like(uncertainty_score)
-            )
-
-            min_uncertainty = normalized_uncertainty.min().item()
-            max_uncertainty = normalized_uncertainty.max().item()
-            std_uncertainty = normalized_uncertainty.std().item()
-
-
-            attention_logits = (
-                attention_logits
-                - self.uncertainty_weight
-                * normalized_uncertainty.unsqueeze(1)
-            )
-
-        att_dist = F.softmax(
-            attention_logits,
+        qk = (
+            q * k
+        ).sum(
             dim=-1
         )
+        # [B,H,N,N]
 
-        att_dist = att_dist.reshape(
-            B,
-            self.num_heads,
-            N,
-            1,
-            N
+        # ====================================================
+        # Original relational attention
+        # No uncertainty
+        # ====================================================
+        att_dist = F.softmax(
+            qk * self.scale,
+            dim=-1
         )
+        # [B,H,N,N]
 
+        # ====================================================
+        # Relational V
+        # ====================================================
         v = (
-            v_n.reshape(
-                B,
-                self.num_heads,
-                1,
-                N,
-                self.head_dim
-            )
-
+            v_n.unsqueeze(2)
             + v_e
-
         )
+        # [B,H,N,N,Dh]
 
-        new_nodes = torch.matmul(
-            att_dist,
-            v
+        new_nodes = torch.sum(
+            att_dist.unsqueeze(-1) * v,
+            dim=3
         )
-
-        new_nodes = new_nodes.reshape(
-            B,
-            self.num_heads,
-            N,
-            self.head_dim
-        )
+        # [B,H,N,Dh]
 
         new_nodes = new_nodes.permute(
-            0,
-            2,
-            1,
-            3
-        )
-
-        new_nodes = new_nodes.reshape(
+            0, 2, 1, 3
+        ).reshape(
             B,
             N,
             self.num_heads * self.head_dim
         )
 
-        new_nodes = self.proj_o(
+        return self.proj_o(
             new_nodes
         )
-
-        return new_nodes

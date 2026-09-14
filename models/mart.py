@@ -7,6 +7,7 @@ from .prtuncertain import RT, RTNoEdgeInit
 from .hrtuncertain import HRT, HRTNoEdgeInit
 
 import torch.nn.functional as F
+import math
 
 def interpolate_between_past_future(
     past: torch.Tensor,
@@ -1018,23 +1019,12 @@ class PairwiseEdgeUncertainty(nn.Module):
         return sampled_edges, node_delta_stack, aux
 
 
-# ============================================================
-
-# UNCERTAIN MART
-# Reasoning
-# Current:
-# Pair uncertainty = ON
-# Group uncertainty = OFF by default
-#
-# Output:
-# [B,N,S,K,T,2]
-# ============================================================
-
 class UNCERTAINMARTREASONING(nn.Module):
-
     def __init__(self, args):
         super().__init__()
+
         self.args = args
+
         module_args = {
             "num_layers": 1,
             "num_heads": args.num_heads,
@@ -1066,6 +1056,10 @@ class UNCERTAINMARTREASONING(nn.Module):
             concat=True
         )
 
+        # ==================================================
+        # Pair encoder
+        # ==================================================
+
         self.pair_encoders = nn.ModuleList()
 
         for layer_index in range(
@@ -1077,14 +1071,17 @@ class UNCERTAINMARTREASONING(nn.Module):
                         **module_args
                     )
                 )
-
             else:
-
                 self.pair_encoders.append(
                     RTNoEdgeInit(
                         **module_args
                     )
                 )
+
+        # ==================================================
+        # Group encoder
+        # deterministic
+        # ==================================================
 
         group_module_args = dict(
             module_args
@@ -1099,32 +1096,27 @@ class UNCERTAINMARTREASONING(nn.Module):
         for layer_index in range(
             args.num_layers
         ):
-
             if layer_index == 0:
                 self.hyper_encoders.append(
                     HRT(
                         **group_module_args
                     )
                 )
-
             else:
-
                 self.hyper_encoders.append(
                     HRTNoEdgeInit(
                         **group_module_args
                     )
                 )
 
+        # ==================================================
+        # Epistemic uncertainty
+        # ==================================================
+
         self.edge_mc_samples = getattr(
             args,
             "edge_mc_samples",
-            100
-        )
-
-        self.group_mc_samples = getattr(
-            args,
-            "group_mc_samples",
-            self.edge_mc_samples
+            20
         )
 
         self.num_edge_samples = getattr(
@@ -1139,42 +1131,18 @@ class UNCERTAINMARTREASONING(nn.Module):
             args.sample_k
         )
 
-        # ====================================================
-        # [NEW]
-        # group uncertainty switch
-        # ====================================================
-
-        self.use_group_uncertainty = getattr(
-            args,
-            "use_group_uncertainty",
-            False
-        )
-
         self.pair_uncertainty = InteractionUncertainty(
             edge_dim=args.model_dim,
             hidden_dim=args.hidden_dim,
-            dropout=args.dropout_edge,
+            dropout=getattr(
+                args,
+                "dropout_edge",
+                0.1
+            ),
             sample_scale=getattr(
                 args,
                 "edge_sample_scale",
-                1
-            )
-
-        )
-
-        # ====================================================
-        # [NEW]
-        # kept for future use
-        # ====================================================
-
-        self.group_uncertainty = InteractionUncertainty(
-            edge_dim=args.model_dim,
-            hidden_dim=args.hidden_dim,
-            dropout=args.dropout_edge,
-            sample_scale=getattr(
-                args,
-                "group_sample_scale",
-                0.05
+                1.0
             )
         )
 
@@ -1195,14 +1163,13 @@ class UNCERTAINMARTREASONING(nn.Module):
         x_abs,
         x_rel
     ):
-
         input_components = []
+
         if (
             "pos_x" in self.args.inputs
             and
             "pos_y" in self.args.inputs
         ):
-
             input_components.append(
                 x_abs
             )
@@ -1212,13 +1179,11 @@ class UNCERTAINMARTREASONING(nn.Module):
             and
             "vel_y" in self.args.inputs
         ):
-
             input_components.append(
                 x_rel
             )
 
         if len(input_components) == 0:
-
             raise ValueError(
                 "No valid input components."
             )
@@ -1235,13 +1200,11 @@ class UNCERTAINMARTREASONING(nn.Module):
         batch_size,
         num_agents
     ):
-
         decoder_outputs = []
 
         for decoder_index in range(
             self.num_decoders
         ):
-
             decoder = self._modules[
                 f"head_{decoder_index}"
             ]
@@ -1259,7 +1222,6 @@ class UNCERTAINMARTREASONING(nn.Module):
             )
 
             if pred_k.size(-1) != 2:
-
                 raise ValueError(
                     f"Decoder output shape error: {tuple(pred_k.shape)}"
                 )
@@ -1268,13 +1230,10 @@ class UNCERTAINMARTREASONING(nn.Module):
                 pred_k
             )
 
-        decoder_stack = torch.stack(
+        return torch.stack(
             decoder_outputs,
             dim=2
         )
-
-        return decoder_stack
-
         # [B,N,K,T,2]
 
     def forward(
@@ -1283,7 +1242,6 @@ class UNCERTAINMARTREASONING(nn.Module):
         x_rel,
         return_aux=False
     ):
-
         B, N, T_obs, _ = x_abs.shape
 
         cur_pos = x_abs[
@@ -1329,11 +1287,9 @@ class UNCERTAINMARTREASONING(nn.Module):
             )
         )
 
-        # ====================================================
-
+        # ==================================================
         # Pair initial edge
-
-        # ====================================================
+        # ==================================================
 
         e_pair_initial = self.pair_encoders[
             0
@@ -1341,23 +1297,12 @@ class UNCERTAINMARTREASONING(nn.Module):
             n_initial
         )
 
-        # ====================================================
-        # Pair uncertainty
+        # ==================================================
+        # Epistemic distribution
         #
-        # current:
-        # no self mask
-        # ====================================================
-
-        mask = torch.eye(
-            N,
-            dtype=torch.bool,
-            device=e_pair_initial.device
-        ).view(
-            1,
-            N,
-            N,
-            1
-        )
+        # mu = MC mean
+        # variance = MC variance
+        # ==================================================
 
         pair_reasoning_edges, pair_unc_aux = self.pair_uncertainty(
             edge_feat=e_pair_initial,
@@ -1366,15 +1311,22 @@ class UNCERTAINMARTREASONING(nn.Module):
             mask=None
         )
 
-        pair_total_var = pair_unc_aux[
-            "total_var_edge"
-        ]
+        # pair_reasoning_edges = e_pair_initial.unsqueeze(3).expand(
+        #     -1,
+        #     -1,
+        #     -1,
+        #     self.num_edge_samples,
+        #     -1
+        # )
 
-        # ====================================================
 
-        # Group initial edge
+        # [B,N,N,S,D]
 
-        # ====================================================
+        # ==================================================
+        # Group branch
+        #
+        # deterministic，因此只计算一次
+        # ==================================================
 
         e_group_initial, group_matrix = self.hyper_encoders[
             0
@@ -1382,67 +1334,43 @@ class UNCERTAINMARTREASONING(nn.Module):
             n_initial
         )
 
-        # ====================================================
+        n_group = n_initial
+        e_group = e_group_initial
+        G_group = group_matrix
 
-        # Optional Group uncertainty
+        n_group, e_group, G_group = self.hyper_encoders[
+            0
+        ].reasoning(
+            node_features=n_group,
+            edge_features=e_group,
+            G=G_group
+        )
 
-        # ====================================================
-
-        if self.use_group_uncertainty:
-
-            group_reasoning_edges, group_unc_aux = self.group_uncertainty(
-                edge_feat=e_group_initial,
-                mc_samples=self.group_mc_samples,
-                num_edge_samples=self.num_edge_samples,
-                mask=None
+        for layer_index in range(
+            1,
+            self.args.num_layers
+        ):
+            n_group, e_group, G_group = self.hyper_encoders[
+                layer_index
+            ].reasoning(
+                node_features=n_group,
+                edge_features=e_group,
+                G=G_group
             )
 
-            group_total_var = group_unc_aux[
-                "total_var_edge"
-            ]
-
-        else:
-
-            group_reasoning_edges = e_group_initial.unsqueeze(
-                2
-            ).expand(
-                -1,
-                -1,
-                self.num_edge_samples,
-                -1
-            )
-
-            group_unc_aux = None
-            group_total_var = None
-
-        # ====================================================
-
-        # S stochastic hypotheses
-
-        # ====================================================
+        # ==================================================
+        # S epistemic edge samples
+        # ==================================================
 
         n_pair_samples = []
-
         e_pair_samples = []
 
-        n_group_samples = []
-
-        e_group_samples = []
-
         n_final_samples = []
-
         decoder_sample_stacks = []
 
         for sample_index in range(
             self.num_edge_samples
         ):
-
-            # ================================================
-
-            # Pair
-
-            # ================================================
-
             e_pair_s = pair_reasoning_edges[
                 :,
                 :,
@@ -1453,80 +1381,39 @@ class UNCERTAINMARTREASONING(nn.Module):
 
             n_pair_s = n_initial
 
+            # ==================================================
+            # Original RT reasoning
+            #
+            # ONLY:
+            # node_features
+            # sampled edge_features
+            #
+            # uncertainty 不再输入 attention
+            # ==================================================
+
             n_pair_s, e_pair_s = self.pair_encoders[
-
                 0
-
             ].reasoning(
                 node_features=n_pair_s,
-                edge_features=e_pair_s,
-                edge_uncertainty=pair_total_var
+                edge_features=e_pair_s
             )
 
             for layer_index in range(
                 1,
                 self.args.num_layers
             ):
-
                 n_pair_s, e_pair_s = self.pair_encoders[
                     layer_index
                 ].reasoning(
                     node_features=n_pair_s,
-                    edge_features=e_pair_s,
-                    edge_uncertainty=pair_total_var
+                    edge_features=e_pair_s
                 )
-
-            # ================================================
-
-            # Group
-
-            # ================================================
-
-            e_group_s = group_reasoning_edges[
-                :,
-                :,
-                sample_index,
-                :
-            ]
-
-            n_group_s = n_initial
-
-            group_matrix_s = group_matrix
-
-            n_group_s, e_group_s, group_matrix_s = self.hyper_encoders[
-                0
-            ].reasoning(
-                node_features=n_group_s,
-                edge_features=e_group_s,
-                G=group_matrix_s,
-                edge_uncertainty=group_total_var
-            )
-
-            for layer_index in range(
-                1,
-                self.args.num_layers
-            ):
-
-                n_group_s, e_group_s, group_matrix_s = self.hyper_encoders[
-                    layer_index
-                ].reasoning(
-                    node_features=n_group_s,
-                    edge_features=e_group_s,
-                    G=group_matrix_s,
-                    edge_uncertainty=group_total_var
-                )
-
-            # ================================================
-
-            # Fusion
-
-            # ================================================
 
             n_final_s = torch.cat(
                 [
                     n_initial,
                     n_pair_s,
-                    n_group_s
+                    n_group
                 ],
                 dim=-1
             )
@@ -1546,14 +1433,6 @@ class UNCERTAINMARTREASONING(nn.Module):
                 e_pair_s
             )
 
-            n_group_samples.append(
-                n_group_s
-            )
-
-            e_group_samples.append(
-                e_group_s
-            )
-
             n_final_samples.append(
                 n_final_s
             )
@@ -1562,86 +1441,59 @@ class UNCERTAINMARTREASONING(nn.Module):
                 decoder_stack_s
             )
 
-        # ====================================================
-
+        # ==================================================
         # Stack
-
-        # ====================================================
+        # ==================================================
 
         n_pair_stack = torch.stack(
             n_pair_samples,
             dim=2
         )
-
         # [B,N,S,D]
 
         e_pair_stack = torch.stack(
             e_pair_samples,
             dim=3
         )
-
         # [B,N,N,S,D]
-
-        n_group_stack = torch.stack(
-            n_group_samples,
-            dim=2
-        )
-
-        # [B,N,S,D]
-
-        e_group_stack = torch.stack(
-            e_group_samples,
-            dim=2
-        )
-
-        # [B,E,S,D]
 
         n_final_stack = torch.stack(
             n_final_samples,
             dim=2
         )
-
         # [B,N,S,3D]
 
-        sampled_decoder_stack = torch.stack(
+        out = torch.stack(
             decoder_sample_stacks,
             dim=2
         )
-
         # [B,N,S,K,T,2]
-
-        out = sampled_decoder_stack
-
-        # ====================================================
-
-        # AUX
-
-        # ====================================================
 
         aux = {
             "n_initial": n_initial,
+
             "e_pair_initial": e_pair_initial,
+
             "pair_reasoning_edges": pair_reasoning_edges,
+
             "pair_uncertainty": pair_unc_aux,
+
             "n_pair_stack": n_pair_stack,
+
             "e_pair_stack": e_pair_stack,
+
             "e_group_initial": e_group_initial,
+
             "group_matrix": group_matrix,
-            "group_reasoning_edges": group_reasoning_edges,
-            "group_uncertainty": group_unc_aux,
-            "n_group_stack": n_group_stack,
-            "e_group_stack": e_group_stack,
+
+            "n_group": n_group,
+
+            "e_group": e_group,
+
             "n_final_stack": n_final_stack,
-            "sampled_decoder_stack": sampled_decoder_stack,
+
             "sampled_traj": out
-
         }
-
-        # ====================================================
-
-        # compatibility with current pair uncertainty loss
-
-        # ====================================================
 
         aux["edge_uncertainty"] = {
             "sampled_edges": pair_unc_aux[
@@ -1654,273 +1506,105 @@ class UNCERTAINMARTREASONING(nn.Module):
 
             "U_e_edge": pair_unc_aux[
                 "U_e_edge"
-            ],
-
-            "U_a_edge": pair_unc_aux[
-                "U_a_edge"
-            ],
-
-            "total_var_edge": pair_unc_aux[
-                "total_var_edge"
             ]
-
         }
 
         if return_aux:
-
             return out, aux
 
         return out
 
 class InteractionUncertainty(nn.Module):
-    def __init__(self, edge_dim, hidden_dim, dropout=0.3, sample_scale=0.1):
+    def __init__(self, edge_dim, hidden_dim, dropout=0.1, sample_scale=1.0):
         super().__init__()
-        self.edge_dim = edge_dim
-        self.hidden_dim = hidden_dim
         self.dropout = dropout
         self.sample_scale = sample_scale
-
         self.mc_edge_fc1 = nn.Linear(edge_dim, hidden_dim)
         self.mc_edge_fc2 = nn.Linear(hidden_dim, edge_dim)
 
-        self.edge_alea_head = nn.Sequential(
-            nn.Linear(edge_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, edge_dim)
-        )
-
-        self.total_uncertainty_mlp = nn.Sequential(
-            nn.Linear(edge_dim * 2, edge_dim),
-            nn.ReLU(),
-            nn.Linear(edge_dim, edge_dim),
-            # nn.Softplus()
-        )
-        self.min_var = 1e-4
-
-        self.max_var = 10.0
-
     def stochastic_edge_forward(self, edge_feat, force_dropout=False):
-        h = self.mc_edge_fc1(edge_feat)
-        h = F.relu(h)
+        h = F.relu(self.mc_edge_fc1(edge_feat))
         h = F.dropout(
             h,
             p=self.dropout,
             training=(self.training or force_dropout)
         )
-        h = self.mc_edge_fc2(h)
+        return 0.1 * torch.tanh(self.mc_edge_fc2(h))
 
+    def compute_edge_distribution(self, edge_feat, mc_samples=20, mask=None):
+        mc_residual = torch.stack([
+            self.stochastic_edge_forward(edge_feat, force_dropout=True)
+            for _ in range(mc_samples)
+        ], dim=0)  # [M,B,N,N,D]
 
-    # ==================== [NEW] ====================
+        mc_residual = mc_residual - mc_residual.mean(dim=0, keepdim=True)
 
-    # 防止 MC residual 无限制增长
+        mu_edge = edge_feat
 
-    # ===============================================
-
-        h = torch.tanh(
-            h
+        U_e_edge = (
+            mc_residual.var(dim=0, unbiased=False)
+            if mc_samples > 1
+            else torch.zeros_like(edge_feat)
         )
-
-        h = 0.1 * h
-
-        return edge_feat + h
-
-    def compute_edge_distribution(self, edge_feat, mc_samples=5, mask=None):
-        mc_edge_samples = []
-
-        for _ in range(mc_samples):
-            edge_m = self.stochastic_edge_forward(
-                edge_feat,
-                force_dropout=True
-            )
-            mc_edge_samples.append(edge_m)
-
-        mc_edge_stack = torch.stack(
-            mc_edge_samples,
-            dim=0
-        )
-
-        # ==================== [MODIFIED] ====================
-        # MC Dropout mean
-        # ===================================================
-        mu_edge = mc_edge_stack.mean(
-            dim=0
-        )
-        # ========================================================
-
-        # Epistemic uncertainty
-
-        # ========================================================
-
-        if mc_samples > 1:
-            U_e_edge = mc_edge_stack.var(
-                dim=0,
-                unbiased=False
-            )
-
-        else:
-
-            U_e_edge = torch.zeros_like(
-                mu_edge
-            )
-
-        # ========================================================
-        # Aleatoric uncertainty
-        # bounded in [min_var, max_var]
-        # ========================================================
-
-        U_a_edge = (
-            self.min_var
-            + (self.max_var - self.min_var)
-            * torch.sigmoid(
-                self.edge_alea_head(
-                    edge_feat
-                )
-            )
-        )
-
-        # ========================================================
-
-        # [NEW]
-
-        # Independent uncertainty scale normalization
-        # preserve edge-to-edge uncertainty differences
-
-        # ========================================================
-
-        Ua_scale = torch.sqrt(
-            U_a_edge.pow(2).mean(
-                dim=(0, 1, 2),
-                keepdim=True
-            )
-        ).detach().clamp_min(
-            1e-6
-        )
-
-        Ue_scale = torch.sqrt(
-            U_e_edge.pow(2).mean(
-                dim=(0, 1, 2),
-                keepdim=True
-            )
-
-        ).detach().clamp_min(
-            1e-6
-        )
-
-        U_a_norm = (
-            U_a_edge
-            / Ua_scale
-        )
-
-        U_e_norm = (
-            U_e_edge
-            / Ue_scale
-        )
-
-        # ========================================================
-
-        # Uncertainty fusion
-
-        # ========================================================
-
-        total_var_logits = self.total_uncertainty_mlp(
-            torch.cat(
-                [
-                    U_a_norm,
-                    U_e_norm
-                ],
-
-                dim=-1
-            )
-
-        )
-
-        # ========================================================
-
-        # Bounded final variance
-
-        # ========================================================
-
-        total_var_edge = (
-            self.min_var
-            + (self.max_var - self.min_var)
-            * torch.sigmoid(
-                total_var_logits
-            )
-        )
-
-        min_val = total_var_edge.min().item()
-        max_val = total_var_edge.max().item()
-        mean_val = total_var_edge.mean().item()
-        std_val = total_var_edge.std().item()
 
         if mask is not None:
             mu_edge = mu_edge.masked_fill(mask, 0.0)
             U_e_edge = U_e_edge.masked_fill(mask, 0.0)
-            U_a_edge = U_a_edge.masked_fill(mask, 0.0)
-            total_var_edge = total_var_edge.masked_fill(mask, 0.0)
+            mc_residual = mc_residual.masked_fill(
+                mask.unsqueeze(0), 0.0
+            )
 
         return {
-            "mc_edge_stack": mc_edge_stack,
             "mu_edge": mu_edge,
             "U_e_edge": U_e_edge,
-            "U_a_edge": U_a_edge,
-            "total_var_edge": total_var_edge
+            "mc_residual": mc_residual
         }
 
-    def sample_edges(self, mu_edge, total_var_edge, num_edge_samples, mask=None):
-        sample_shape = list(mu_edge.shape[:-1]) + [
-            num_edge_samples,
-            mu_edge.size(-1)
-        ]
+    def sample_edges(self, mu_edge, mc_residual, num_edge_samples=20, mask=None):
+        M = mc_residual.size(0)
+        S = num_edge_samples
 
-        epsilon = torch.randn(
-            *sample_shape,
+        coeff = torch.randn(
+            S, M,
             device=mu_edge.device,
             dtype=mu_edge.dtype
+        ) / math.sqrt(M)
+
+        sampled_residual = torch.einsum(
+            'sm,mbijd->sbijd',
+            coeff,
+            mc_residual
         )
-        sampling_var = total_var_edge.detach()
+
         sampled_edges = (
-            mu_edge.unsqueeze(-2)
-            + self.sample_scale
-            * torch.sqrt(sampling_var).unsqueeze(-2)
-            * epsilon
-        )
-        # sampled_edges = (
-        #     mu_edge.unsqueeze(-2)
-        #     + self.sample_scale
-        #     * torch.sqrt(total_var_edge).unsqueeze(-2)
-        #     * epsilon
-        # )
+            mu_edge.unsqueeze(0)
+            + self.sample_scale * sampled_residual
+        ).permute(1, 2, 3, 0, 4)  # [B,N,N,S,D]
 
         if mask is not None:
             sampled_edges = sampled_edges.masked_fill(
-                mask.unsqueeze(-2),
-                0.0
+                mask.unsqueeze(-2), 0.0
             )
 
         return sampled_edges
 
-    def forward(self, edge_feat, mc_samples=5, num_edge_samples=20, mask=None):
-        distribution = self.compute_edge_distribution(
-            edge_feat=edge_feat,
-            mc_samples=mc_samples,
-            mask=mask
+    def forward(
+        self,
+        edge_feat,
+        mc_samples=20,
+        num_edge_samples=20,
+        mask=None
+    ):
+        dist = self.compute_edge_distribution(
+            edge_feat, mc_samples, mask
         )
 
         sampled_edges = self.sample_edges(
-            mu_edge=distribution["mu_edge"],
-            total_var_edge=distribution["total_var_edge"],
-            num_edge_samples=num_edge_samples,
-            mask=mask
+            dist["mu_edge"],
+            dist["mc_residual"],
+            num_edge_samples,
+            mask
         )
 
-        aux = {
-            "mc_edge_stack": distribution["mc_edge_stack"],
-            "mu_edge": distribution["mu_edge"],
-            "U_e_edge": distribution["U_e_edge"],
-            "U_a_edge": distribution["U_a_edge"],
-            "total_var_edge": distribution["total_var_edge"],
-            "sampled_edges": sampled_edges
-        }
-
-        return sampled_edges, aux
+        dist["sampled_edges"] = sampled_edges
+        return sampled_edges, dist
