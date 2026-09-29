@@ -15,706 +15,473 @@ from models.mart import UNCERTAINMARTREASONING as MART
 from loaders.dataloader_nba import NBADataset
 import torch
 import torch.nn.functional as F
+from scipy.stats import spearmanr
+def compute_loss(y_pred, target, aux, lambda_epi=0.01, lambda_selector=0.01):
+    if target.dim() == 5 and target.size(2) == 1: target = target.squeeze(2)
 
+    # Main Best-of-K
+    pred = y_pred[:, :, 0]
+    dist = torch.norm(pred - target.unsqueeze(2), dim=-1)
+    ade_k = dist.mean(dim=-1)
+    best_ade = ade_k.min(dim=2)[0]
+    best_fde = dist[:, :, :, -1].min(dim=2)[0]
+    loss_main = best_ade.mean()
 
-def compute_loss(
-    y_pred,
-    target,
-    aux,
-    lambda_edge=0.1,
-    max_perturb_ratio=0.1,
-    gamma=5.0
-):
-    if target.dim() == 5 and target.size(2) == 1:
-        target = target.squeeze(2)
+    # Epistemic [B,N,E,M,T,2]
+    epi_pred = aux["epi_samples"]
+    B, N, E, M, T, D = epi_pred.shape
 
-    if y_pred.dim() != 6:
-        raise ValueError(
-            f"Expected y_pred [B,N,S,K,T,2], got {tuple(y_pred.shape)}"
-        )
+    # 每个 head 对 M 次 MC 取平均预测，再用 GT 选择 best head
+    epi_mean = epi_pred.mean(dim=3)
+    epi_head_ade = torch.norm(epi_mean - target.unsqueeze(2), dim=-1).mean(dim=-1)
+    best_epi_ade, best_epi_idx = epi_head_ade.min(dim=2)
 
-    B, N, S, K, T, _ = y_pred.shape
+    # 只取 GT-best head
+    idx = best_epi_idx[:, :, None, None, None, None].expand(B, N, 1, M, T, D)
+    best_epi_samples = torch.gather(epi_pred, 2, idx).squeeze(2)
 
-    edge_uncertainty = aux["edge_uncertainty"]
-
-    # ==================================================
-    # 1. Best-of-S prediction loss
-    # ==================================================
-
-    target_expand = target.unsqueeze(2).unsqueeze(3)
-
-    displacement_error = torch.norm(
-        y_pred - target_expand,
+    # best head 内所有 MC realization 都需要学 GT
+    loss_epi = torch.norm(
+        best_epi_samples - target.unsqueeze(2),
         dim=-1
-    )
-    # [B,N,S,K,T]
-
-    decoder_ade = displacement_error.mean(dim=4)
-    # [B,N,S,K]
-
-    best_decoder_ade_per_sample, best_decoder_idx = (
-        decoder_ade.min(dim=3)
-    )
-    # [B,N,S]
-
-    best_sample_ade, best_sample_idx = (
-        best_decoder_ade_per_sample.min(dim=2)
-    )
-    # [B,N]
-
-    loss_pred = best_sample_ade.mean()
-
-    # ==================================================
-    # 2. Edge perturbation constraint
-    # ==================================================
-
-    sampled_edges = edge_uncertainty["sampled_edges"]
-    # [B,N,N,S,D]
-
-    mu_edge = edge_uncertainty["mu_edge"]
-    # [B,N,N,D]
-
-    delta_edge = (
-        sampled_edges
-        - mu_edge.unsqueeze(3)
-    )
-
-    perturb_ratio = (
-        delta_edge.norm(dim=-1)
-        /
-        mu_edge.detach()
-        .norm(dim=-1)
-        .unsqueeze(3)
-        .clamp_min(1e-2)
-    )
-    # [B,N,N,S]
-
-    edge_mask = ~torch.eye(
-        N,
-        dtype=torch.bool,
-        device=y_pred.device
-    )
-
-    edge_mask_s = edge_mask[
-        None, :, :, None
-    ].expand(
-        B, N, N, S
-    )
-
-    valid_ratio = perturb_ratio[
-        edge_mask_s
-    ]
-
-    excess = F.relu(
-        valid_ratio - max_perturb_ratio
-    )
-
-    loss_edge_reg = (
-        torch.exp(gamma * excess) - 1.0
     ).mean()
 
-    # ==================================================
-    # 3. Epistemic variance
-    # ==================================================
-
-    U_e_edge = edge_uncertainty["U_e_edge"]
-    # [B,N,N,D]
-
-    edge_mask_u = edge_mask[
-        None, :, :
-    ].expand(
-        B, N, N
+    # Selector 学习预测哪个 head 是 GT-best
+    selector_logits = aux["epi_selector_logits"]
+    loss_selector = F.cross_entropy(
+        selector_logits.reshape(B * N, E),
+        best_epi_idx.detach().reshape(B * N)
     )
 
-    epistemic_var = (
-        U_e_edge.mean(dim=-1)[edge_mask_u]
-        .mean()
-    )
+    selector_acc = (
+        selector_logits.argmax(dim=-1) == best_epi_idx
+    ).float().mean()
 
-    # ==================================================
-    # 4. SampleEdgeVar
-    #
-    # sampled edge BEFORE RT
-    # [B,N,N,S,D]
-    # ==================================================
+    loss = loss_main + lambda_epi * loss_epi + lambda_selector * loss_selector
 
-    pair_reasoning_edges = aux[
-        "pair_reasoning_edges"
-    ]
-
-    sample_edge_var_map = (
-        pair_reasoning_edges.var(
-            dim=3,
-            unbiased=False
-        ).mean(dim=-1)
-    )
-    # [B,N,N]
-
-    sample_edge_var = (
-        sample_edge_var_map[edge_mask_u]
-        .mean()
-    )
-
-    # ==================================================
-    # 5. PairEdgeVar
-    #
-    # pair edge AFTER RT
-    # [B,N,N,S,D]
-    # ==================================================
-
-    e_pair_stack = aux[
-        "e_pair_stack"
-    ]
-
-    pair_edge_var_map = (
-        e_pair_stack.var(
-            dim=3,
-            unbiased=False
-        ).mean(dim=-1)
-    )
-    # [B,N,N]
-
-    pair_edge_var = (
-        pair_edge_var_map[edge_mask_u]
-        .mean()
-    )
-
-    # ==================================================
-    # 6. PairNodeVar
-    #
-    # pair node AFTER RT
-    # [B,N,S,D]
-    # ==================================================
-
-    n_pair_stack = aux[
-        "n_pair_stack"
-    ]
-
-    pair_node_var = (
-        n_pair_stack.var(
-            dim=2,
-            unbiased=False
-        ).mean()
-    )
-
-    # ==================================================
-    # 7. Trajectory PredVar
-    # ==================================================
-
-    best_decoder_idx_expand = best_decoder_idx[
-        :, :, :, None, None, None
-    ].expand(
-        B, N, S, 1, T, 2
-    )
-
-    best_pred_per_sample = torch.gather(
-        y_pred,
-        dim=3,
-        index=best_decoder_idx_expand
-    ).squeeze(3)
-    # [B,N,S,T,2]
-
-    pred_var = (
-        best_pred_per_sample.var(
-            dim=2,
-            unbiased=False
-        ).mean()
-    )
-
-    # ==================================================
-    # 8. Best-of-S monitoring
-    # ==================================================
-
-    sample_ade_mean = (
-        best_decoder_ade_per_sample.mean()
-    )
-
-    best_sample_gain = (
-        sample_ade_mean
-        - best_sample_ade.mean()
-    )
-
-    # ==================================================
-    # 9. Total loss
-    # ==================================================
-
-    total_loss = (
-        loss_pred
-        + lambda_edge * loss_edge_reg
-    )
-
-    loss_dict = {
-        "loss_pred":
-            loss_pred.detach(),
-
-        "loss_edge_reg":
-            loss_edge_reg.detach(),
-
-        "epistemic_var":
-            epistemic_var.detach(),
-
-        "perturb_ratio":
-            valid_ratio.mean().detach(),
-
-        "sample_edge_var":
-            sample_edge_var.detach(),
-
-        "pair_edge_var":
-            pair_edge_var.detach(),
-
-        "pair_node_var":
-            pair_node_var.detach(),
-
-        "pred_var":
-            pred_var.detach(),
-
-        "sample_ade_mean":
-            sample_ade_mean.detach(),
-
-        "best_sample_ade":
-            best_sample_ade.mean().detach(),
-
-        "best_sample_gain":
-            best_sample_gain.detach()
+    return loss, {
+        "loss_main": loss_main.detach(),
+        "loss_epi": loss_epi.detach(),
+        "loss_selector": loss_selector.detach(),
+        "selector_acc": selector_acc.detach(),
+        "best_epi_ade": best_epi_ade.mean().detach(),
+        "best_ade": best_ade.mean().detach(),
+        "best_fde": best_fde.mean().detach(),
+        "epi_unc": aux["epi_unc"].mean().detach()
     }
-
-    return total_loss, loss_dict
 
 def train(epoch, model, optimizer, loader):
     model.train()
+    total, counter = 0.0, 0
 
-    avg_meter = {
-        "loss": 0.0,
-        "loss_pred": 0.0,
-        "loss_edge_reg": 0.0,
-        "epistemic_var": 0.0,
-        "perturb_ratio": 0.0,
-
-        "sample_edge_var": 0.0,
-        "pair_edge_var": 0.0,
-        "pair_node_var": 0.0,
-
-        "pred_var": 0.0,
-        "sample_ade_mean": 0.0,
-        "best_sample_ade": 0.0,
-        "best_sample_gain": 0.0,
-        "counter": 0
-    }
-
-    loader_len = len(loader)
-
-    for i, (data, _) in enumerate(loader):
+    for i, data in enumerate(loader):
         optimizer.zero_grad()
 
         x_abs, y = data
         x_abs, y = x_abs.cuda(), y.cuda()
-
         B, N, _, _ = x_abs.shape
 
         x_rel = torch.zeros_like(x_abs)
         x_rel[:, :, 1:] = x_abs[:, :, 1:] - x_abs[:, :, :-1]
         x_rel[:, :, 0] = x_rel[:, :, 1]
 
-        y_pred, aux = model(
-            x_abs,
-            x_rel,
-            return_aux=True
-        )
+        y_pred, aux = model(x_abs, x_rel, return_aux=True)
 
         if opts.pred_rel:
             cur_pos = x_abs[:, :, -1:, :2].unsqueeze(2).unsqueeze(3)
             y_pred = torch.cumsum(y_pred, dim=4) + cur_pos
 
-        total_loss, loss_dict = compute_loss(
-            y_pred=y_pred,
-            target=y,
-            aux=aux,
-            lambda_edge=0.1,
-            max_perturb_ratio=0.1,
-            gamma=5.0
+            epi_cur_pos = x_abs[:, :, -1:, :2].unsqueeze(2).unsqueeze(3)
+            # [B,N,1,1,1,2]
+
+            aux["epi_samples"] = (
+                torch.cumsum(aux["epi_samples"], dim=4)
+                + epi_cur_pos
+            )
+
+        loss, d = compute_loss(
+            y_pred,
+            y,
+            aux,
+            lambda_epi=getattr(opts, "lambda_epi", 0.01),
+            lambda_selector=getattr(opts, "lambda_selector", 0.01)
         )
 
-        total_loss.backward()
+        loss.backward()
 
         if opts.clip_grad is not None:
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                opts.clip_grad
-            )
+            torch.nn.utils.clip_grad_norm_(model.parameters(), opts.clip_grad)
 
         optimizer.step()
 
-        weight = B * N
-
-        avg_meter["loss"] += total_loss.item() * weight
-
-        for key in [
-            "loss_pred",
-            "loss_edge_reg",
-            "epistemic_var",
-            "perturb_ratio",
-
-            "sample_edge_var",
-            "pair_edge_var",
-            "pair_node_var",
-
-            "pred_var",
-            "sample_ade_mean",
-            "best_sample_ade",
-            "best_sample_gain"
-        ]:
-            avg_meter[key] += (
-                loss_dict[key].item() * weight
-            )
-
-        avg_meter["counter"] += weight
+        w = B * N
+        total += loss.item() * w
+        counter += w
 
         if i % 100 == 0:
-            th = get_th(opts, model)
-
             print(
-                "[{}] Epochs: {:02d}/{:02d}| It: {:04d}/{:04d} | "
-                "Loss: {:.6f} | Pred: {:.6f} | EdgeReg: {:.6f} | "
-                "Perturb: {:.4f} | EpiVar: {:.8f} | "
-                "SampleEdgeVar: {:.8f} | PairEdgeVar: {:.8f} | "
-                "PairNodeVar: {:.8f} | PredVar: {:.6f} | "
-                "SampleADEMean: {:.6f} | BestSampleADE: {:.6f} | "
-                "Gain: {:.6f} | Threshold: {} | LR: {}"
-                .format(
-                    loader.dataset.mode.upper(),
-                    epoch + 1,
-                    opts.num_epochs,
-                    i + 1,
-                    loader_len,
-
-                    total_loss.item(),
-                    loss_dict["loss_pred"].item(),
-                    loss_dict["loss_edge_reg"].item(),
-
-                    loss_dict["perturb_ratio"].item(),
-                    loss_dict["epistemic_var"].item(),
-
-                    loss_dict["sample_edge_var"].item(),
-                    loss_dict["pair_edge_var"].item(),
-                    loss_dict["pair_node_var"].item(),
-                    loss_dict["pred_var"].item(),
-
-                    loss_dict["sample_ade_mean"].item(),
-                    loss_dict["best_sample_ade"].item(),
-                    loss_dict["best_sample_gain"].item(),
-
-                    th,
-                    optimizer.param_groups[0]["lr"]
-                )
+                f"[TRAIN] Epoch {epoch+1}/{opts.num_epochs} | "
+                f"It {i+1}/{len(loader)} | "
+                f"Loss {loss.item():.4f} | "
+                f"Main {d['loss_main'].item():.4f} | "
+                f"Epi {d['loss_epi'].item():.4f} | "
+                f"Sel {d['loss_selector'].item():.4f} | "
+                f"SelAcc {d['selector_acc'].item():.3f} | "
+                f"EpiBestADE {d['best_epi_ade'].item():.4f} | "
+                f"EpiUnc {d['epi_unc'].item():.4f}"
             )
 
-    return avg_meter["loss"] / avg_meter["counter"]
-
+    return total / counter
 def test(epoch, model, loader):
     model.eval()
-
-    S = model.num_edge_samples
     K = model.num_decoders
 
-    avg_meter = {
-        "epoch": epoch,
-
-        "ade_1": 0.0,
-        "fde_1": 0.0,
-
-        "ade_2": 0.0,
-        "fde_2": 0.0,
-
-        "ade_3": 0.0,
-        "fde_3": 0.0,
-
-        "ade_4": 0.0,
-        "fde_4": 0.0,
-
+    meter = {
+        "ade_1": 0., "fde_1": 0.,
+        "ade_2": 0., "fde_2": 0.,
+        "ade_3": 0., "fde_3": 0.,
+        "ade_4": 0., "fde_4": 0.,
+        "epi_ade_1": 0., "epi_fde_1": 0.,
+        "epi_ade_2": 0., "epi_fde_2": 0.,
+        "epi_ade_3": 0., "epi_fde_3": 0.,
+        "epi_ade_4": 0., "epi_fde_4": 0.,
         "counter": 0
     }
 
-    with torch.no_grad():
-        for _, (data, sample_ids) in enumerate(loader):
-            x_abs, y = data
+    unc_ade_all, unc_fde_all = [], []
+    ade_all, fde_all = [], []
+    epi_ade_all, epi_fde_all = [], []
 
-            x_abs = x_abs.cuda()
-            y = y.cuda()
+    with torch.no_grad():
+        for x_abs, y in loader:
+            x_abs, y = x_abs.cuda(), y.cuda()
+            if y.dim() == 5 and y.size(2) == 1: y = y.squeeze(2)
 
             B, N, _, _ = x_abs.shape
 
-            # ==================================================
-            # Relative trajectory
-            # ==================================================
-            x_rel = torch.zeros_like(
-                x_abs
-            )
-
-            x_rel[:, :, 1:] = (
-                x_abs[:, :, 1:]
-                - x_abs[:, :, :-1]
-            )
-
-            x_rel[:, :, 0] = (
-                x_rel[:, :, 1]
-            )
+            x_rel = torch.zeros_like(x_abs)
+            x_rel[:, :, 1:] = x_abs[:, :, 1:] - x_abs[:, :, :-1]
+            x_rel[:, :, 0] = x_rel[:, :, 1]
 
             # ==================================================
-            # Prediction
-            #
-            # [B,N,S,K,T,2]
+            # Forward
+            # selector 在 model 内部选择 epistemic head
             # ==================================================
-            y_pred, aux = model(
-                x_abs,
-                x_rel,
-                return_aux=True
-            )
-
-            if y_pred.dim() != 6:
-                raise ValueError(
-                    f"Expected [B,N,S,K,T,2], got {tuple(y_pred.shape)}"
-                )
-
-            if y_pred.size(2) != S:
-                raise ValueError(
-                    f"Expected {S} edge samples, got {y_pred.size(2)}"
-                )
-
-            if y_pred.size(3) != K:
-                raise ValueError(
-                    f"Expected {K} decoders, got {y_pred.size(3)}"
-                )
+            y_pred, aux = model(x_abs, x_rel, return_aux=True)
 
             # ==================================================
-            # Relative -> Absolute
+            # Main prediction -> absolute
+            # [B,N,1,K,T,2]
             # ==================================================
             if opts.pred_rel:
-                cur_pos = x_abs[
-                    :, :, -1:, :2
-                ].unsqueeze(
-                    2
-                ).unsqueeze(
-                    3
-                )
+                cur_pos = x_abs[:, :, -1:, :2].unsqueeze(2).unsqueeze(3)
+                y_pred = torch.cumsum(y_pred, dim=4) + cur_pos
 
-                y_pred = torch.cumsum(
-                    y_pred,
-                    dim=4
-                ) + cur_pos
+            y_pred = y_pred[:, :, 0]
+            # [B,N,K,T,2]
 
-            # ==================================================
-            # NumPy
-            # ==================================================
-            y_pred = y_pred.cpu().numpy()
-            # [B,N,S,K,T,2]
+            main_dist = torch.norm(
+                y_pred - y.unsqueeze(2),
+                dim=-1
+            )
+            # [B,N,K,T]
 
-            target = y.cpu().numpy()[
-                :, :, None, None, :, :
-            ]
-            # [B,N,1,1,T,2]
-
+            T = main_dist.size(-1)
             w = B * N
 
-            dist = np.linalg.norm(
-                y_pred - target,
-                axis=-1
-            )
-            # [B,N,S,K,T]
+            # ==================================================
+            # Epistemic branch
+            # epi_samples: [B,N,E,M,T,2]
+            # ==================================================
+            epi_samples = aux["epi_samples"]
+
+            if opts.pred_rel:
+                epi_cur_pos = x_abs[:, :, -1:, :2].unsqueeze(2).unsqueeze(3)
+                epi_samples = torch.cumsum(epi_samples, dim=4) + epi_cur_pos
 
             # ==================================================
-            # Evaluation at different horizons
+            # Selector-selected epistemic head
+            # ==================================================
+            selected_idx = aux["epi_selected_idx"]
+            # [B,N]
+
+            M = epi_samples.size(3)
+
+            idx = selected_idx[:, :, None, None, None, None].expand(
+                B, N, 1, M, T, 2
+            )
+
+            selected_epi_samples = torch.gather(
+                epi_samples,
+                dim=2,
+                index=idx
+            ).squeeze(2)
+            # [B,N,M,T,2]
+
+            # MC samples 是 epistemic samples，不做 Best-of-M
+            # 用 MC mean trajectory 计算 epistemic branch ADE/FDE
+            selected_epi_mean = selected_epi_samples.mean(dim=2)
+            # [B,N,T,2]
+
+            epi_dist = torch.norm(
+                selected_epi_mean - y,
+                dim=-1
+            )
+            # [B,N,T]
+
+            # ==================================================
+            # Main + Epistemic metrics
             # ==================================================
             for key, end in [
-                ("1", 5),
-                ("2", 10),
-                ("3", 15),
-                ("4", dist.shape[-1])
+                ("1", min(5, T)),
+                ("2", min(10, T)),
+                ("3", min(15, T)),
+                ("4", T)
             ]:
-                ade_all = np.mean(
-                    dist[:, :, :, :, :end],
-                    axis=4
-                )
-                # [B,N,S,K]
+                # ---------------- Main Best-of-K ----------------
+                main_ade_k = main_dist[:, :, :, :end].mean(dim=3)
+                main_fde_k = main_dist[:, :, :, end - 1]
 
-                fde_all = dist[
-                    :, :, :, :, end - 1
-                ]
-                # [B,N,S,K]
+                best_main_ade = main_ade_k.min(dim=2)[0]
+                best_main_fde = main_fde_k.min(dim=2)[0]
 
-                # ==============================================
-                # Best-of-K within every edge sample
-                # ==============================================
-                best_ade_per_sample = np.min(
-                    ade_all,
-                    axis=3
-                )
-                # [B,N,S]
+                meter[f"ade_{key}"] += best_main_ade.mean().item() * w
+                meter[f"fde_{key}"] += best_main_fde.mean().item() * w
 
-                best_fde_per_sample = np.min(
-                    fde_all,
-                    axis=3
-                )
-                # [B,N,S]
+                # ---------------- Selector Epi ----------------
+                epi_ade = epi_dist[:, :, :end].mean(dim=2)
+                epi_fde = epi_dist[:, :, end - 1]
 
-                # ==============================================
-                # Best-of-S edge samples
-                # ==============================================
-                best_ade = np.min(
-                    best_ade_per_sample,
-                    axis=2
-                )
-                # [B,N]
+                meter[f"epi_ade_{key}"] += epi_ade.mean().item() * w
+                meter[f"epi_fde_{key}"] += epi_fde.mean().item() * w
 
-                best_fde = np.min(
-                    best_fde_per_sample,
-                    axis=2
-                )
-                # [B,N]
+                if key == "4":
+                    ade_agent = best_main_ade
+                    fde_agent = best_main_fde
+                    epi_ade_agent = epi_ade
+                    epi_fde_agent = epi_fde
 
-                avg_meter[
-                    f"ade_{key}"
-                ] += np.mean(
-                    best_ade
-                ) * w
+            # ==================================================
+            # Uncertainty
+            # aux["epi_unc"] 本身已经是 selector-selected head uncertainty
+            # ==================================================
+            unc_ade_all.append(
+                aux["epi_unc"].reshape(-1).cpu().numpy()
+            )
 
-                avg_meter[
-                    f"fde_{key}"
-                ] += np.mean(
-                    best_fde
-                ) * w
+            unc_fde_all.append(
+                aux["epi_unc_final"].reshape(-1).cpu().numpy()
+            )
 
-            avg_meter["counter"] += w
+            ade_all.append(
+                ade_agent.reshape(-1).cpu().numpy()
+            )
 
-    c = avg_meter[
-        "counter"
-    ]
+            fde_all.append(
+                fde_agent.reshape(-1).cpu().numpy()
+            )
 
-    ade_1 = avg_meter["ade_1"] / c
-    fde_1 = avg_meter["fde_1"] / c
+            epi_ade_all.append(
+                epi_ade_agent.reshape(-1).cpu().numpy()
+            )
 
-    ade_2 = avg_meter["ade_2"] / c
-    fde_2 = avg_meter["fde_2"] / c
+            epi_fde_all.append(
+                epi_fde_agent.reshape(-1).cpu().numpy()
+            )
 
-    ade_3 = avg_meter["ade_3"] / c
-    fde_3 = avg_meter["fde_3"] / c
-
-    ade_4 = avg_meter["ade_4"] / c
-    fde_4 = avg_meter["fde_4"] / c
-
-    th = get_th(
-        opts,
-        model
-    )
-
-    print(
-        f"\n[{loader.dataset.mode.upper()}] "
-        f"Epoch {epoch} th: {th}"
-    )
-
-    print("=" * 60)
+            meter["counter"] += w
 
     # ==================================================
-    # 注意：
-    # K decoder × S edge samples
-    # 实际候选数是 S*K
+    # Average metrics
     # ==================================================
-    print(
-        f"[BEST-OF-{K} DECODERS -> "
-        f"BEST-OF-{S} EDGE SAMPLES]"
-    )
-
-    print(
-        "[{}] minADE/minFDE (1.0s): {:.3f}/{:.3f}".format(
-            loader.dataset.mode.upper(),
-            ade_1,
-            fde_1
-        )
-    )
-
-    print(
-        "[{}] minADE/minFDE (2.0s): {:.3f}/{:.3f}".format(
-            loader.dataset.mode.upper(),
-            ade_2,
-            fde_2
-        )
-    )
-
-    print(
-        "[{}] minADE/minFDE (3.0s): {:.3f}/{:.3f}".format(
-            loader.dataset.mode.upper(),
-            ade_3,
-            fde_3
-        )
-    )
-
-    print(
-        "[{}] minADE/minFDE (4.0s): {:.3f}/{:.3f}".format(
-            loader.dataset.mode.upper(),
-            ade_4,
-            fde_4
-        )
-    )
-
-    print(
-        "=" * 60 + "\n"
-    )
-
-    return {
-        "ade_1": ade_1,
-        "fde_1": fde_1,
-
-        "ade_2": ade_2,
-        "fde_2": fde_2,
-
-        "ade_3": ade_3,
-        "fde_3": fde_3,
-
-        "ade_4": ade_4,
-        "fde_4": fde_4
+    c = meter["counter"]
+    results = {
+        k: meter[k] / c
+        for k in meter
+        if k != "counter"
     }
 
-def main():
+    unc_ade_all = np.concatenate(unc_ade_all)
+    unc_fde_all = np.concatenate(unc_fde_all)
+
+    ade_all = np.concatenate(ade_all)
+    fde_all = np.concatenate(fde_all)
+
+    epi_ade_all = np.concatenate(epi_ade_all)
+    epi_fde_all = np.concatenate(epi_fde_all)
 
     # ==================================================
-    # [REMOVED]
-    #
-    # 原来：
-    # best_edge_bank = {}
-    #
-    # 现在不再需要
+    # Uncertainty vs MAIN error
     # ==================================================
+    rho_ade, p_ade = spearmanr(
+        unc_ade_all,
+        ade_all
+    )
 
-    if args.seed >= 0:
-        seed = args.seed
-        setup_seed(
-            seed
-        )
-    else:
-        seed = random.randint(
-            0,
-            1000
-        )
+    rho_fde, p_fde = spearmanr(
+        unc_fde_all,
+        fde_all
+    )
 
-        setup_seed(
-            seed
+    # ==================================================
+    # Uncertainty vs EPISTEMIC branch error
+    # ==================================================
+    rho_epi_ade, p_epi_ade = spearmanr(
+        unc_ade_all,
+        epi_ade_all
+    )
+
+    rho_epi_fde, p_epi_fde = spearmanr(
+        unc_fde_all,
+        epi_fde_all
+    )
+
+    # ==================================================
+    # Bins
+    # ==================================================
+    bins_ade = compute_uncertainty_bins(
+        unc_ade_all,
+        ade_all,
+        "MAIN-ADE",
+        5
+    )
+
+    bins_fde = compute_uncertainty_bins(
+        unc_fde_all,
+        fde_all,
+        "MAIN-FDE",
+        5
+    )
+
+    bins_epi_ade = compute_uncertainty_bins(
+        unc_ade_all,
+        epi_ade_all,
+        "EPI-ADE",
+        5
+    )
+
+    bins_epi_fde = compute_uncertainty_bins(
+        unc_fde_all,
+        epi_fde_all,
+        "EPI-FDE",
+        5
+    )
+
+    # ==================================================
+    # Print
+    # ==================================================
+    print(f"\n{'=' * 70}")
+    print(f"[{loader.dataset.mode.upper()}] Epoch {epoch}")
+
+    print(f"\n[MAIN BEST-OF-{K}]")
+    for t in range(1, 5):
+        print(
+            f"{t}.0s: "
+            f"{results[f'ade_{t}']:.3f}/"
+            f"{results[f'fde_{t}']:.3f}"
         )
 
     print(
-        '[INFO] The seed is:',
-        seed
+        f"\n[SELECTOR EPISTEMIC DECODER | "
+        f"E={model.num_epi_decoders} | "
+        f"MC={model.epi_samples}]"
     )
+
+    for t in range(1, 5):
+        print(
+            f"{t}.0s: "
+            f"{results[f'epi_ade_{t}']:.3f}/"
+            f"{results[f'epi_fde_{t}']:.3f}"
+        )
+
+    print(f"\nMean EpiUnc: {unc_ade_all.mean():.6f}")
+
+    print(f"\n[UNCERTAINTY vs MAIN]")
+    print(
+        f"Spearman(EpiUncMean, MainADE): "
+        f"{rho_ade:.6f} (p={p_ade:.3e})"
+    )
+    print(
+        f"Spearman(EpiUncFinal, MainFDE): "
+        f"{rho_fde:.6f} (p={p_fde:.3e})"
+    )
+
+    print(f"\n[UNCERTAINTY vs EPISTEMIC BRANCH]")
+    print(
+        f"Spearman(EpiUncMean, EpiADE): "
+        f"{rho_epi_ade:.6f} (p={p_epi_ade:.3e})"
+    )
+    print(
+        f"Spearman(EpiUncFinal, EpiFDE): "
+        f"{rho_epi_fde:.6f} (p={p_epi_fde:.3e})"
+    )
+
+    print("=" * 70)
+
+    # ==================================================
+    # Save results
+    # ==================================================
+    results["spearman_ade"] = float(rho_ade)
+    results["spearman_fde"] = float(rho_fde)
+
+    results["spearman_epi_ade"] = float(rho_epi_ade)
+    results["spearman_epi_fde"] = float(rho_epi_fde)
+
+    results["bins_ade"] = bins_ade
+    results["bins_fde"] = bins_fde
+    results["bins_epi_ade"] = bins_epi_ade
+    results["bins_epi_fde"] = bins_epi_fde
+
+    return results
+
+
+def compute_uncertainty_bins(uncertainty, error, name="ADE", num_bins=5):
+    uncertainty = np.asarray(uncertainty).reshape(-1)
+    error = np.asarray(error).reshape(-1)
+
+    valid = np.isfinite(uncertainty) & np.isfinite(error)
+    uncertainty, error = uncertainty[valid], error[valid]
+
+    bins = np.array_split(np.argsort(uncertainty), num_bins)
+    results = []
+
+    print(f"\n{'=' * 60}\n{name} Epistemic Uncertainty Bins\n{'=' * 60}")
+
+    for i, idx in enumerate(bins):
+        r = {
+            "bin": i + 1,
+            "num_samples": len(idx),
+            "uncertainty": float(uncertainty[idx].mean()),
+            "error": float(error[idx].mean())
+        }
+        results.append(r)
+        print(
+            f"Bin {i+1}/{num_bins} | "
+            f"N {len(idx):6d} | "
+            f"Unc {r['uncertainty']:.8f} | "
+            f"{name} {r['error']:.6f}"
+        )
+
+    print("=" * 60)
+    return results
+
+def main():
+    # ==================================================
+    # Seed
+    # ==================================================
+    seed = args.seed if args.seed >= 0 else random.randint(0, 1000)
+    setup_seed(seed)
+    print(f"[INFO] Seed: {seed}")
 
     # ==================================================
     # Dataset
     # ==================================================
-
     if not args.test:
         dataset_train = NBADataset(
             obs_len=opts.past_length,
             pred_len=opts.future_length,
-            mode='train'
+            mode="train"
         )
-
         loader_train = torch.utils.data.DataLoader(
             dataset_train,
             batch_size=opts.batch_size,
@@ -726,7 +493,7 @@ def main():
     dataset_test = NBADataset(
         obs_len=opts.past_length,
         pred_len=opts.future_length,
-        mode='test' if args.test else 'val'
+        mode="test" if args.test else "val"
     )
 
     loader_test = torch.utils.data.DataLoader(
@@ -739,33 +506,19 @@ def main():
     # ==================================================
     # Model
     # ==================================================
+    model = MART(opts).cuda()
 
-    model = MART(
-        opts
-    ).cuda()
-
-    # 如果你的新模型 class 实际叫 UNCERTAINMART，
-    # 则这里改成：
-    #
-    # model = UNCERTAINMART(opts).cuda()
-
+    print(model)
+    print(f"[INFO] Model params: {sum(p.numel() for p in model.parameters())}")
     print(
-        model
-    )
-
-    print(
-        '[INFO] Model params: {}'.format(
-            sum(
-                p.numel()
-                for p in model.parameters()
-            )
-        )
+        f"[INFO] Main decoders: {model.num_decoders} | "
+        f"Epistemic decoders: {model.num_epi_decoders} | "
+        f"MC samples/head: {model.epi_samples}"
     )
 
     # ==================================================
     # Optimizer
     # ==================================================
-
     optimizer = optim.Adam(
         model.parameters(),
         lr=opts.lr,
@@ -773,20 +526,18 @@ def main():
     )
 
     # ==================================================
-    # [MODIFIED]
-    # 防止 scheduler_type=None 时 scheduler 未定义
+    # Scheduler
     # ==================================================
-
     scheduler = None
 
-    if opts.scheduler_type == 'StepLR':
+    if getattr(opts, "scheduler_type", None) == "StepLR":
         scheduler = lr_scheduler.StepLR(
             optimizer,
             step_size=opts.decay_step,
             gamma=opts.decay_gamma
         )
 
-    elif opts.scheduler_type == 'MultiStepLR':
+    elif getattr(opts, "scheduler_type", None) == "MultiStepLR":
         scheduler = lr_scheduler.MultiStepLR(
             optimizer,
             milestones=opts.milestones,
@@ -796,112 +547,63 @@ def main():
     # ==================================================
     # Checkpoint directory
     # ==================================================
-
     model_save_dir = os.path.join(
-        './checkpoints',
-        os.path.basename(
-            args.config
-        ).split('.')[0]
+        "./checkpoints",
+        os.path.basename(args.config).split(".")[0]
     )
+    os.makedirs(model_save_dir, exist_ok=True)
 
-    os.makedirs(
-        model_save_dir,
-        exist_ok=True
-    )
+    best_name = f"{args.dataset}_ckpt_best_epistemic_decoder.pth"
+    best_path = os.path.join(model_save_dir, best_name)
 
     # ==================================================
     # Test only
     # ==================================================
-
     if args.test:
+        print(f"[INFO] Loading model from: {best_path}")
 
-        # ==================================================
-        # [MODIFIED]
-        # 删除 history
-        # ==================================================
-
-        model_name = (
-            args.dataset
-            + '_ckpt_best_uncertain_edge_attention_nll.pth'
-        )
-
-        model_path = os.path.join(
-            model_save_dir,
-            model_name
-        )
-
-        print(
-            '[INFO] Loading model from:',
-            model_path
-        )
-
-        model_ckpt = torch.load(
-            model_path
-        )
-
-        model.load_state_dict(
-            model_ckpt[
-                'state_dict'
-            ],
-            strict=True
-        )
+        model_ckpt = torch.load(best_path, map_location="cuda")
+        model.load_state_dict(model_ckpt["state_dict"], strict=True)
 
         test_results = test(
-            model_ckpt[
-                'epoch'
-            ],
+            model_ckpt["epoch"],
             model,
             loader_test
         )
 
         print(
-            '[INFO] Test Best-of-{} | '
-            'ADE: {:.5f} | FDE: {:.5f}'
-            .format(
-                model.num_edge_samples,
-                test_results[
-                    "ade_4"
-                ],
-                test_results[
-                    "fde_4"
-                ]
-            )
+            f"[INFO] Test | "
+            f"Main Best-of-{model.num_decoders} | "
+            f"EpiHeads={model.num_epi_decoders} | "
+            f"MC={model.epi_samples} | "
+            f"ADE={test_results['ade_4']:.5f} | "
+            f"FDE={test_results['fde_4']:.5f} | "
+            f"Spearman(U,ADE)={test_results['spearman_ade']:.5f} | "
+            f"Spearman(U,FDE)={test_results['spearman_fde']:.5f}"
         )
 
-        exit()
+        return
 
     # ==================================================
     # Training
     # ==================================================
-
     results = {
-        'epochs': [],
-        'losses': []
+        "epochs": [],
+        "losses": [],
+        "ade": [],
+        "fde": [],
+        "spearman_ade": [],
+        "spearman_fde": []
     }
 
-    best_val_fde = float(
-        "inf"
-    )
-
-    best_val_ade = float(
-        "inf"
-    )
-
+    best_val_fde = float("inf")
+    best_val_ade = float("inf")
     best_epoch = -1
 
-    for epoch in range(
-        opts.num_epochs
-    ):
-
-        # ==================================================
-        # [MODIFIED]
-        #
-        # 原来：
-        # train(..., best_edge_bank)
-        #
-        # 现在：
-        # ==================================================
-
+    for epoch in range(opts.num_epochs):
+        # ----------------------------------------------
+        # Train
+        # ----------------------------------------------
         train_loss = train(
             epoch,
             model,
@@ -909,147 +611,110 @@ def main():
             loader_train
         )
 
+        # ----------------------------------------------
+        # Validation
+        # ----------------------------------------------
         test_results = test(
             epoch,
             model,
             loader_test
         )
 
-        current_fde = test_results[
-            "fde_4"
-        ]
+        current_ade = test_results["ade_4"]
+        current_fde = test_results["fde_4"]
 
-        current_ade = test_results[
-            "ade_4"
-        ]
+        results["epochs"].append(epoch)
+        results["losses"].append(train_loss)
+        results["ade"].append(current_ade)
+        results["fde"].append(current_fde)
+        results["spearman_ade"].append(test_results["spearman_ade"])
+        results["spearman_fde"].append(test_results["spearman_fde"])
 
-        results[
-            'epochs'
-        ].append(
-            epoch
-        )
-
-        results[
-            'losses'
-        ].append(
-            current_fde
-        )
-
-        # ==================================================
-        # Checkpoint state
-        # ==================================================
-
+        # ----------------------------------------------
+        # Checkpoint
+        # ----------------------------------------------
         state = {
-            'epoch': epoch,
+            "epoch": epoch,
+            "state_dict": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "train_loss": train_loss,
 
-            'state_dict': model.state_dict(),
+            "ade_1": test_results["ade_1"],
+            "fde_1": test_results["fde_1"],
+            "ade_2": test_results["ade_2"],
+            "fde_2": test_results["fde_2"],
+            "ade_3": test_results["ade_3"],
+            "fde_3": test_results["fde_3"],
+            "ade_4": current_ade,
+            "fde_4": current_fde,
 
-            'optimizer': optimizer.state_dict(),
+            "spearman_ade": test_results["spearman_ade"],
+            "spearman_fde": test_results["spearman_fde"],
 
-            'train_loss': train_loss,
-
-            'ade_1': test_results["ade_1"],
-            'fde_1': test_results["fde_1"],
-
-            'ade_2': test_results["ade_2"],
-            'fde_2': test_results["fde_2"],
-
-            'ade_3': test_results["ade_3"],
-            'fde_3': test_results["fde_3"],
-
-            'ade_4': test_results["ade_4"],
-            'fde_4': test_results["fde_4"]
+            "num_decoders": model.num_decoders,
+            "num_epi_decoders": model.num_epi_decoders,
+            "epi_samples": model.epi_samples
         }
 
-        # ==================================================
-        # Best checkpoint
-        #
-        # 仍然按照 minFDE@4s 保存
-        # ==================================================
-
+        # ----------------------------------------------
+        # Best checkpoint: minFDE@4s
+        # ----------------------------------------------
         if current_fde < best_val_fde:
+            best_val_fde = current_fde
+            best_val_ade = current_ade
+            best_epoch = epoch
 
-            best_val_fde = (
-                current_fde
+            torch.save(state, best_path)
+
+            print(
+                f"[INFO] New best checkpoint | "
+                f"Epoch={epoch} | "
+                f"ADE={best_val_ade:.5f} | "
+                f"FDE={best_val_fde:.5f}"
             )
 
-            best_val_ade = (
-                current_ade
-            )
-
-            best_epoch = (
-                epoch
-            )
-
-            # ==================================================
-            # [MODIFIED]
-            # 删除 history
-            # ==================================================
-
-            best_path = os.path.join(
-                model_save_dir,
-                str(args.dataset)
-                + '_ckpt_best_uncertain_edge_attention_nll.pth'
-            )
-
-            torch.save(
-                state,
-                best_path
-            )
-
+        # ----------------------------------------------
+        # Epoch summary
+        # ----------------------------------------------
         print(
-            '[INFO] Best {} Best-of-{} | '
-            'FDE: {:.5f} | ADE: {:.5f} | '
-            'Best Epoch: {}\n'
-            .format(
-                loader_test.dataset.mode.capitalize(),
-                model.num_edge_samples,
-                best_val_fde,
-                best_val_ade,
-                best_epoch
-            )
+            f"[INFO] Epoch {epoch+1}/{opts.num_epochs} | "
+            f"Main Best-of-{model.num_decoders} | "
+            f"EpiHeads={model.num_epi_decoders} | "
+            f"MC={model.epi_samples} | "
+            f"ADE={current_ade:.5f} | "
+            f"FDE={current_fde:.5f} | "
+            f"Spearman(U,ADE)={test_results['spearman_ade']:.5f} | "
+            f"Spearman(U,FDE)={test_results['spearman_fde']:.5f}"
         )
 
-        # ==================================================
+        # ----------------------------------------------
         # Save current epoch
-        # ==================================================
-
+        # ----------------------------------------------
         file_path = os.path.join(
             model_save_dir,
-            str(args.dataset)
-            + '_ckpt_uncertain_edge_attention_nll_'
-            + str(epoch)
-            + '.pth'
+            f"{args.dataset}_ckpt_epistemic_decoder_{epoch}.pth"
         )
 
         if epoch > 0:
-
-            remove_file_path = os.path.join(
+            old_path = os.path.join(
                 model_save_dir,
-                str(args.dataset)
-                + '_ckpt_uncertain_edge_attention_nll_'
-                + str(epoch - 1)
-                + '.pth'
+                f"{args.dataset}_ckpt_epistemic_decoder_{epoch-1}.pth"
             )
+            if os.path.exists(old_path): os.remove(old_path)
 
-            if os.path.exists(
-                remove_file_path
-            ):
-                os.remove(
-                    remove_file_path
-                )
+        torch.save(state, file_path)
 
-        torch.save(
-            state,
-            file_path
-        )
+        if scheduler is not None: scheduler.step()
 
-        # ==================================================
-        # Scheduler
-        # ==================================================
-
-        if scheduler is not None:
-            scheduler.step()
+    # ==================================================
+    # Final summary
+    # ==================================================
+    print(
+        f"[INFO] Training finished | "
+        f"Best epoch={best_epoch} | "
+        f"Best ADE={best_val_ade:.5f} | "
+        f"Best FDE={best_val_fde:.5f}"
+    )
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='MART for Trajectory Prediction')
@@ -1069,3 +734,9 @@ if __name__ == "__main__":
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     main()
+
+
+
+
+
+    

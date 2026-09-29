@@ -127,27 +127,480 @@ class PositionalAgentEncoding(nn.Module):
         return self.dropout(x) #(N, T, D)
 
 
+# class Decoder(nn.Module):
+#     def __init__(self, args):
+#         super().__init__()
+#         self.args = args
+#         self.multiplier = len(args.hyper_scales) + 1
+#         self.decoder_mlp = MLP(
+#             args.model_dim*self.multiplier,
+#             args.future_length*2,
+#             hidden_dims=(
+#                 args.decoder_hidden_dim,
+#                 args.decoder_hidden_dim // 2
+#             )
+#         )
+
+#     def forward(self, final_feature, cur_location):
+#         outputs = self.decoder_mlp(final_feature)
+#         outputs = outputs.view(-1, self.args.future_length, 2)
+#         if not self.args.pred_rel:
+#             outputs = outputs + cur_location
+        
+#         return outputs        
+
+class ResidualDecoderBlock(nn.Module):
+
+    def __init__(
+        self,
+        hidden_dim,
+        dropout=0.0
+    ):
+        super().__init__()
+
+        self.fc1 = nn.Linear(
+            hidden_dim,
+            hidden_dim
+        )
+
+        self.fc2 = nn.Linear(
+            hidden_dim,
+            hidden_dim
+        )
+
+        self.norm = nn.LayerNorm(
+            hidden_dim
+        )
+
+        self.dropout = nn.Dropout(
+            dropout
+        )
+
+    def forward(
+        self,
+        x
+    ):
+        residual = x
+
+        out = self.fc1(
+            x
+        )
+
+        out = F.relu(
+            out,
+            inplace=True
+        )
+
+        out = self.dropout(
+            out
+        )
+
+        out = self.fc2(
+            out
+        )
+
+        out = self.dropout(
+            out
+        )
+
+        out = self.norm(
+            residual + out
+        )
+
+        out = F.relu(
+            out,
+            inplace=True
+        )
+
+        return out
+
+
+
 class Decoder(nn.Module):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self.multiplier = len(args.hyper_scales) + 1
-        self.decoder_mlp = MLP(
-            args.model_dim*self.multiplier,
-            args.future_length*2,
-            hidden_dims=(
-                args.decoder_hidden_dim,
-                args.decoder_hidden_dim // 2
+        H = getattr(args, "decoder_hidden_dim", args.hidden_dim)
+
+        self.feature_fc = nn.Linear(args.model_dim * 3, H)
+        self.unc_film = nn.Sequential(nn.Linear(1, H // 2), nn.ReLU(inplace=True), nn.Linear(H // 2, H * 2))
+        self.decoder = nn.Sequential(
+            nn.ReLU(inplace=True),
+            nn.Linear(H, H // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(H // 2, args.future_length * 2)
+        )
+
+    def forward(self, feature, cur_pos, uncertainty):
+        h = self.feature_fc(feature)
+        gamma, beta = self.unc_film(uncertainty).chunk(2, dim=-1)
+        gamma, beta = 0.1 * torch.tanh(gamma), 0.1 * torch.tanh(beta)
+        h = h * (1.0 + gamma) + beta
+        out = self.decoder(h).view(-1, self.args.future_length, 2)
+        if not self.args.pred_rel: out = out + cur_pos
+        return out
+
+    
+# class Decoder(nn.Module):
+
+#     def __init__(
+#         self,
+#         args
+#     ):
+#         super().__init__()
+
+#         self.args = args
+
+#         # ==================================================
+#         # Keep exactly the same input dimension
+#         # as the original MART decoder
+#         # ==================================================
+
+#         self.multiplier = (
+#             len(args.hyper_scales)
+#             + 1
+#         )
+
+#         input_dim = (
+#             args.model_dim
+#             * self.multiplier
+#         )
+
+#         # ==================================================
+#         # Capacity-matched hidden dimension
+#         #
+#         # Current model:
+#         # ~0.99M
+#         #
+#         # Original MART:
+#         # ~1.58M
+#         #
+#         # Need roughly +0.59M parameters.
+#         #
+#         # 448 is a good first choice.
+#         # ==================================================
+
+#         self.hidden_dim = getattr(
+#             args,
+#             "decoder_matched_hidden_dim",
+#             448
+#         )
+
+#         dropout = getattr(
+#             args,
+#             "decoder_dropout",
+#             0.0
+#         )
+
+#         # ==================================================
+#         # Input projection
+#         #
+#         # final_feature
+#         # -> strong latent representation
+#         # ==================================================
+
+#         self.input_proj = nn.Sequential(
+
+#             nn.Linear(
+#                 input_dim,
+#                 self.hidden_dim
+#             ),
+
+#             nn.LayerNorm(
+#                 self.hidden_dim
+#             ),
+
+#             nn.ReLU(
+#                 inplace=True
+#             )
+#         )
+
+#         # ==================================================
+#         # Residual nonlinear decoding
+#         #
+#         # Important:
+#         # sampled interaction differences are allowed
+#         # to generate nonlinear trajectory differences.
+#         # ==================================================
+
+#         self.res_block = (
+#             ResidualDecoderBlock(
+#                 hidden_dim=
+#                     self.hidden_dim,
+
+#                 dropout=
+#                     dropout
+#             )
+#         )
+
+#         # ==================================================
+#         # Trajectory head
+#         # ==================================================
+
+#         self.output_head = nn.Sequential(
+
+#             nn.Linear(
+#                 self.hidden_dim,
+#                 self.hidden_dim // 2
+#             ),
+
+#             nn.ReLU(
+#                 inplace=True
+#             ),
+
+#             nn.Linear(
+#                 self.hidden_dim // 2,
+#                 args.future_length * 2
+#             )
+#         )
+
+    # def forward(
+    #     self,
+    #     final_feature,
+    #     cur_location
+    # ):
+    #     """
+    #     final_feature:
+    #         [B*N, D]
+    #         or any shape supported by Linear
+    #         with last dim = input_dim
+
+    #     output:
+    #         [-1, T_future, 2]
+    #     """
+
+    #     # ==================================================
+    #     # Strong feature projection
+    #     # ==================================================
+
+    #     hidden = self.input_proj(
+    #         final_feature
+    #     )
+
+    #     # ==================================================
+    #     # Residual nonlinear mapping
+    #     # ==================================================
+
+    #     hidden = self.res_block(
+    #         hidden
+    #     )
+
+    #     # ==================================================
+    #     # Decode full future trajectory
+    #     # ==================================================
+
+    #     outputs = self.output_head(
+    #         hidden
+    #     )
+
+    #     outputs = outputs.view(
+    #         -1,
+    #         self.args.future_length,
+    #         2
+    #     )
+
+    #     # ==================================================
+    #     # Absolute prediction
+    #     # ==================================================
+
+    #     if not self.args.pred_rel:
+
+    #         outputs = (
+    #             outputs
+    #             + cur_location
+    #         )
+
+    #     return outputs
+
+    
+class InteractionConditionedDecoder(nn.Module):
+
+    def __init__(
+        self,
+        args
+    ):
+        super().__init__()
+
+        self.args = args
+
+        D = args.model_dim
+
+        hidden_dim = getattr(
+            args,
+            "decoder_hidden_dim",
+            512
+        )
+
+        # ==============================================
+        # Base:
+        #
+        # individual + group
+        # ==============================================
+
+        self.base_encoder = nn.Sequential(
+            nn.Linear(
+                2 * D,
+                hidden_dim
+            ),
+            nn.ReLU(inplace=True),
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim
+            ),
+            nn.ReLU(inplace=True)
+        )
+
+        # ==============================================
+        # Interaction conditioner
+        #
+        # n_pair_s -> gamma, beta
+        # ==============================================
+
+        self.interaction_conditioner = nn.Sequential(
+            nn.Linear(
+                D,
+                hidden_dim
+            ),
+            nn.ReLU(inplace=True),
+
+            nn.Linear(
+                hidden_dim,
+                2 * hidden_dim
             )
         )
 
-    def forward(self, final_feature, cur_location):
-        outputs = self.decoder_mlp(final_feature)
-        outputs = outputs.view(-1, self.args.future_length, 2)
+        # ==============================================
+        # Refinement
+        # ==============================================
+
+        self.refine = nn.Sequential(
+            nn.Linear(
+                hidden_dim,
+                hidden_dim
+            ),
+            nn.ReLU(inplace=True),
+
+            nn.Linear(
+                hidden_dim,
+                hidden_dim
+            ),
+            nn.ReLU(inplace=True)
+        )
+
+        # ==============================================
+        # Trajectory head
+        # ==============================================
+
+        self.traj_head = nn.Sequential(
+            nn.Linear(
+                hidden_dim,
+                hidden_dim // 2
+            ),
+            nn.ReLU(inplace=True),
+
+            nn.Linear(
+                hidden_dim // 2,
+                args.future_length * 2
+            )
+        )
+
+    def forward(
+        self,
+        n_initial,
+        n_pair,
+        n_group,
+        cur_location
+    ):
+
+        # ==============================================
+        # Base representation
+        # ==============================================
+
+        base_feature = torch.cat(
+            [
+                n_initial,
+                n_group
+            ],
+            dim=-1
+        )
+
+        base_feature = self.base_encoder(
+            base_feature
+        )
+
+        # ==============================================
+        # Interaction-conditioned FiLM
+        # ==============================================
+
+        gamma_beta = (
+            self.interaction_conditioner(
+                n_pair
+            )
+        )
+
+        gamma, beta = (
+            gamma_beta.chunk(
+                2,
+                dim=-1
+            )
+        )
+
+        gamma = (
+            0.1
+            * torch.tanh(
+                gamma
+            )
+        )
+
+        beta = (
+            0.1
+            * torch.tanh(
+                beta
+            )
+        )
+
+        feature = (
+            base_feature
+            * (1.0 + gamma)
+            + beta
+        )
+
+        # ==============================================
+        # Refinement
+        # ==============================================
+
+        feature = (
+            feature
+            + self.refine(
+                feature
+            )
+        )
+
+        # ==============================================
+        # Trajectory
+        # ==============================================
+
+        outputs = (
+            self.traj_head(
+                feature
+            )
+        )
+
+        outputs = outputs.view(
+            -1,
+            self.args.future_length,
+            2
+        )
+
         if not self.args.pred_rel:
-            outputs = outputs + cur_location
-        
-        return outputs        
+
+            outputs = (
+                outputs
+                + cur_location
+            )
+
+        return outputs
 
 
 class MART(nn.Module):
@@ -1022,7 +1475,6 @@ class PairwiseEdgeUncertainty(nn.Module):
 class UNCERTAINMARTREASONING(nn.Module):
     def __init__(self, args):
         super().__init__()
-
         self.args = args
 
         module_args = {
@@ -1036,483 +1488,272 @@ class UNCERTAINMARTREASONING(nn.Module):
             "dropout": args.dropout
         }
 
-        self.input_dim = len(
-            args.inputs
-        )
+        # ==================================================
+        # Input
+        # ==================================================
+        self.input_dim = len(args.inputs)
+        self.input_fc = nn.Linear(self.input_dim, args.model_dim)
+        self.input_fc2 = nn.Linear(args.model_dim * args.past_length, args.model_dim)
+        self.pos_encoder = PositionalAgentEncoding(args.model_dim, 0.1, concat=True)
 
-        self.input_fc = nn.Linear(
-            self.input_dim,
-            args.model_dim
-        )
+        # ==================================================
+        # Main deterministic transformer branch
+        # ==================================================
+        self.pair_encoders = nn.ModuleList([
+            RT(**module_args) if i == 0 else RTNoEdgeInit(**module_args)
+            for i in range(args.num_layers)
+        ])
 
-        self.input_fc2 = nn.Linear(
-            args.model_dim * args.past_length,
-            args.model_dim
-        )
+        group_args = dict(module_args)
+        group_args["function_type"] = args.function_type
 
-        self.pos_encoder = PositionalAgentEncoding(
-            args.model_dim,
-            0.1,
-            concat=True
+        self.hyper_encoders = nn.ModuleList([
+            HRT(**group_args) if i == 0 else HRTNoEdgeInit(**group_args)
+            for i in range(args.num_layers)
+        ])
+
+        # ==================================================
+        # Epistemic Transformer branch
+        # ==================================================
+        self.epi_samples = getattr(args, "epi_samples", 20)
+        self.num_epi_decoders = getattr(args, "num_epi_decoders", 20)
+        self.epi_transformer_dropout = getattr(args, "epi_transformer_dropout", 0.2)
+
+        epi_module_args = dict(module_args)
+        epi_module_args["dropout"] = self.epi_transformer_dropout
+
+        self.epi_pair_encoders = nn.ModuleList([
+            RT(**epi_module_args) if i == 0 else RTNoEdgeInit(**epi_module_args)
+            for i in range(args.num_layers)
+        ])
+
+        epi_group_args = dict(epi_module_args)
+        epi_group_args["function_type"] = args.function_type
+
+        self.epi_hyper_encoders = nn.ModuleList([
+            HRT(**epi_group_args) if i == 0 else HRTNoEdgeInit(**epi_group_args)
+            for i in range(args.num_layers)
+        ])
+
+        # ==================================================
+        # 20 Epistemic Decoders
+        # ==================================================
+        self.epistemic_decoders = nn.ModuleList([
+            EpistemicDecoder(args) for _ in range(self.num_epi_decoders)
+        ])
+
+        # selector: [n_initial,n_pair,n_group] -> E heads
+        self.epi_selector = nn.Sequential(
+            nn.Linear(args.model_dim * 3, args.hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(args.hidden_dim, self.num_epi_decoders)
         )
 
         # ==================================================
-        # Pair encoder
+        # Main decoders
         # ==================================================
+        self.num_decoders = getattr(args, "num_decoders", args.sample_k)
+        self.final_dim = args.model_dim * 3
 
-        self.pair_encoders = nn.ModuleList()
+        for k in range(self.num_decoders): self.add_module(f"head_{k}", Decoder(args))
 
-        for layer_index in range(
-            args.num_layers
-        ):
-            if layer_index == 0:
-                self.pair_encoders.append(
-                    RT(
-                        **module_args
-                    )
-                )
-            else:
-                self.pair_encoders.append(
-                    RTNoEdgeInit(
-                        **module_args
-                    )
-                )
+    def build_input(self, x_abs, x_rel):
+        xs = []
+        if "pos_x" in self.args.inputs and "pos_y" in self.args.inputs: xs.append(x_abs)
+        if "vel_x" in self.args.inputs and "vel_y" in self.args.inputs: xs.append(x_rel)
+        if not xs: raise ValueError("No valid input components.")
+        return torch.cat(xs, dim=-1)
 
-        # ==================================================
-        # Group encoder
-        # deterministic
-        # ==================================================
+    def run_pair_branch(self, n_initial, encoders):
+        e = encoders[0].build_initial_edge(n_initial)
+        n, e = encoders[0].reasoning(node_features=n_initial, edge_features=e)
+        for i in range(1, len(encoders)):
+            n, e = encoders[i].reasoning(node_features=n, edge_features=e)
+        return n, e
 
-        group_module_args = dict(
-            module_args
-        )
+    def run_group_branch(self, n_initial, encoders):
+        e, G = encoders[0].build_initial_group(n_initial)
+        n, e, G = encoders[0].reasoning(node_features=n_initial, edge_features=e, G=G)
+        for i in range(1, len(encoders)):
+            n, e, G = encoders[i].reasoning(node_features=n, edge_features=e, G=G)
+        return n, e, G
 
-        group_module_args[
-            "function_type"
-        ] = args.function_type
+    def set_mc_dropout(self, module, enabled=True):
+        for m in module.modules():
+            if isinstance(m, nn.Dropout): m.train(enabled)
 
-        self.hyper_encoders = nn.ModuleList()
+    def run_epistemic_transformer(self, n_initial):
+        # 即使 model.eval()，这里也强制 Transformer dropout 开启
+        self.set_mc_dropout(self.epi_pair_encoders, True)
+        self.set_mc_dropout(self.epi_hyper_encoders, True)
 
-        for layer_index in range(
-            args.num_layers
-        ):
-            if layer_index == 0:
-                self.hyper_encoders.append(
-                    HRT(
-                        **group_module_args
-                    )
-                )
-            else:
-                self.hyper_encoders.append(
-                    HRTNoEdgeInit(
-                        **group_module_args
-                    )
-                )
+        n_pair, e_pair = self.run_pair_branch(n_initial, self.epi_pair_encoders)
+        n_group, e_group, G = self.run_group_branch(n_initial, self.epi_hyper_encoders)
 
-        # ==================================================
-        # Epistemic uncertainty
-        # ==================================================
+        return torch.cat([n_initial, n_pair, n_group], dim=-1), n_pair, e_pair, n_group, e_group
 
-        self.edge_mc_samples = getattr(
-            args,
-            "edge_mc_samples",
-            20
-        )
+    def run_epistemic_branch(self, n_initial, cur_pos_bn):
+        # M stochastic transformer passes
+        # 每次 transformer mask 和 decoder mask 都重新采样
+        all_samples, feature_samples = [], []
 
-        self.num_edge_samples = getattr(
-            args,
-            "num_edge_samples",
-            20
-        )
+        for _ in range(self.epi_samples):
+            epi_feature, _, _, _, _ = self.run_epistemic_transformer(n_initial)
+            feature_samples.append(epi_feature)
 
-        self.num_decoders = getattr(
-            args,
-            "num_decoders",
-            args.sample_k
-        )
-
-        self.pair_uncertainty = InteractionUncertainty(
-            edge_dim=args.model_dim,
-            hidden_dim=args.hidden_dim,
-            dropout=getattr(
-                args,
-                "dropout_edge",
-                0.1
-            ),
-            sample_scale=getattr(
-                args,
-                "edge_sample_scale",
-                1.0
-            )
-        )
-
-        self.final_dim = (
-            args.model_dim * 3
-        )
-
-        for decoder_index in range(
-            self.num_decoders
-        ):
-            self.add_module(
-                f"head_{decoder_index}",
-                Decoder(args)
-            )
-
-    def build_input(
-        self,
-        x_abs,
-        x_rel
-    ):
-        input_components = []
-
-        if (
-            "pos_x" in self.args.inputs
-            and
-            "pos_y" in self.args.inputs
-        ):
-            input_components.append(
-                x_abs
-            )
-
-        if (
-            "vel_x" in self.args.inputs
-            and
-            "vel_y" in self.args.inputs
-        ):
-            input_components.append(
-                x_rel
-            )
-
-        if len(input_components) == 0:
-            raise ValueError(
-                "No valid input components."
-            )
-
-        return torch.cat(
-            input_components,
-            dim=-1
-        )
-
-    def run_all_decoders(
-        self,
-        feature,
-        cur_pos,
-        batch_size,
-        num_agents
-    ):
-        decoder_outputs = []
-
-        for decoder_index in range(
-            self.num_decoders
-        ):
-            decoder = self._modules[
-                f"head_{decoder_index}"
+            head_outputs = [
+                decoder(epi_feature, cur_pos=cur_pos_bn, force_dropout=True)
+                for decoder in self.epistemic_decoders
             ]
 
-            pred_k = decoder(
-                feature,
-                cur_pos
-            )
+            all_samples.append(torch.stack(head_outputs, dim=2))
+            # [B,N,E,T,2]
 
-            pred_k = pred_k.view(
-                batch_size,
-                num_agents,
-                self.args.future_length,
-                -1
-            )
+        epi_samples = torch.stack(all_samples, dim=3)
+        # [B,N,E,M,T,2]
 
-            if pred_k.size(-1) != 2:
-                raise ValueError(
-                    f"Decoder output shape error: {tuple(pred_k.shape)}"
-                )
+        epi_feature_samples = torch.stack(feature_samples, dim=2)
+        # [B,N,M,3D]
 
-            decoder_outputs.append(
-                pred_k
-            )
+        return epi_samples, epi_feature_samples
 
-        return torch.stack(
-            decoder_outputs,
-            dim=2
+    def run_all_decoders(self, feature, uncertainty, cur_pos, B, N):
+        feature = feature.reshape(B * N, -1)
+        uncertainty = uncertainty.reshape(B * N, 1)
+        outputs = []
+
+        for k in range(self.num_decoders):
+            pred = self._modules[f"head_{k}"](feature, cur_pos, uncertainty)
+            outputs.append(pred.view(B, N, self.args.future_length, 2))
+
+        return torch.stack(outputs, dim=2)
+
+    def forward(self, x_abs, x_rel, return_aux=False):
+        B, N, T_obs, _ = x_abs.shape
+
+        cur_pos_bn = x_abs[:, :, -1:, :2]
+        cur_pos = cur_pos_bn.reshape(B * N, 1, 2).contiguous()
+
+        # ==================================================
+        # Input encoding
+        # ==================================================
+        x = self.build_input(x_abs, x_rel).reshape(B * N, T_obs, -1)
+        x = self.input_fc(x)
+        x = self.pos_encoder(x, num_a=B * N)
+        x = x.reshape(B, N, T_obs, self.args.model_dim)
+        n_initial = self.input_fc2(x.reshape(B, N, T_obs * self.args.model_dim))
+
+        # ==================================================
+        # Main transformer
+        # ==================================================
+        n_pair, e_pair = self.run_pair_branch(n_initial, self.pair_encoders)
+        n_group, e_group, G = self.run_group_branch(n_initial, self.hyper_encoders)
+        n_final = torch.cat([n_initial, n_pair, n_group], dim=-1)
+
+        # ==================================================
+        # Epistemic Transformer + 20 decoders
+        #
+        # [B,N,E,M,T,2]
+        # ==================================================
+        epi_samples, epi_feature_samples = self.run_epistemic_branch(
+            n_initial,
+            cur_pos_bn
+        )
+
+        # ==================================================
+        # Variance in absolute-position space
+        # ==================================================
+        epi_for_unc = torch.cumsum(epi_samples, dim=4) if self.args.pred_rel else epi_samples
+
+        # M dimension = 3
+        epi_var_heads = epi_for_unc.var(dim=3, unbiased=False)
+        # [B,N,E,T,2]
+
+        epi_unc_t_heads = torch.sqrt(
+            epi_var_heads.sum(dim=-1).clamp_min(1e-8)
+        )
+        # [B,N,E,T]
+
+        epi_unc_heads = epi_unc_t_heads.mean(dim=-1)
+        # [B,N,E]
+
+        epi_unc_final_heads = epi_unc_t_heads[:, :, :, -1]
+        # [B,N,E]
+
+        # ==================================================
+        # Selector
+        # inference 不使用 GT
+        # ==================================================
+        epi_selector_logits = self.epi_selector(n_final)
+        epi_selector_prob = F.softmax(epi_selector_logits, dim=-1)
+        epi_selected_idx = epi_selector_logits.argmax(dim=-1)
+        # [B,N]
+
+        T = self.args.future_length
+
+        idx_t = epi_selected_idx[:, :, None, None].expand(B, N, 1, T)
+        epi_unc_t = torch.gather(epi_unc_t_heads, 2, idx_t).squeeze(2)
+        # [B,N,T]
+
+        idx_v = epi_selected_idx[:, :, None, None, None].expand(B, N, 1, T, 2)
+        epi_var = torch.gather(epi_var_heads, 2, idx_v).squeeze(2)
+        # [B,N,T,2]
+
+        epi_unc = epi_unc_t.mean(dim=-1, keepdim=True)
+        epi_unc_final = epi_unc_t[:, :, -1:]
+
+        # ==================================================
+        # Normalize uncertainty
+        # ==================================================
+        unc_scale = epi_unc.mean().detach().clamp_min(1e-6)
+        epi_unc_norm = torch.log1p(epi_unc / unc_scale)
+
+        # Main loss 不反向控制 uncertainty branch
+        uncertainty_for_main = epi_unc_norm.detach()
+
+        # ==================================================
+        # Main 20 decoders
+        # ==================================================
+        out = self.run_all_decoders(
+            feature=n_final,
+            uncertainty=uncertainty_for_main,
+            cur_pos=cur_pos,
+            B=B,
+            N=N
         )
         # [B,N,K,T,2]
 
-    def forward(
-        self,
-        x_abs,
-        x_rel,
-        return_aux=False
-    ):
-        B, N, T_obs, _ = x_abs.shape
-
-        cur_pos = x_abs[
-            :, :, -1:, :2
-        ].reshape(
-            B * N,
-            1,
-            2
-        ).contiguous()
-
-        inputs = self.build_input(
-            x_abs,
-            x_rel
-        )
-
-        inputs = inputs.reshape(
-            B * N,
-            T_obs,
-            -1
-        ).contiguous()
-
-        inputs_fc = self.input_fc(
-            inputs
-        )
-
-        inputs_pos = self.pos_encoder(
-            inputs_fc,
-            num_a=B * N
-        )
-
-        inputs_pos = inputs_pos.reshape(
-            B,
-            N,
-            T_obs,
-            self.args.model_dim
-        )
-
-        n_initial = self.input_fc2(
-            inputs_pos.reshape(
-                B,
-                N,
-                T_obs * self.args.model_dim
-            )
-        )
-
-        # ==================================================
-        # Pair initial edge
-        # ==================================================
-
-        e_pair_initial = self.pair_encoders[
-            0
-        ].build_initial_edge(
-            n_initial
-        )
-
-        # ==================================================
-        # Epistemic distribution
-        #
-        # mu = MC mean
-        # variance = MC variance
-        # ==================================================
-
-        pair_reasoning_edges, pair_unc_aux = self.pair_uncertainty(
-            edge_feat=e_pair_initial,
-            mc_samples=self.edge_mc_samples,
-            num_edge_samples=self.num_edge_samples,
-            mask=None
-        )
-
-        # pair_reasoning_edges = e_pair_initial.unsqueeze(3).expand(
-        #     -1,
-        #     -1,
-        #     -1,
-        #     self.num_edge_samples,
-        #     -1
-        # )
-
-
-        # [B,N,N,S,D]
-
-        # ==================================================
-        # Group branch
-        #
-        # deterministic，因此只计算一次
-        # ==================================================
-
-        e_group_initial, group_matrix = self.hyper_encoders[
-            0
-        ].build_initial_group(
-            n_initial
-        )
-
-        n_group = n_initial
-        e_group = e_group_initial
-        G_group = group_matrix
-
-        n_group, e_group, G_group = self.hyper_encoders[
-            0
-        ].reasoning(
-            node_features=n_group,
-            edge_features=e_group,
-            G=G_group
-        )
-
-        for layer_index in range(
-            1,
-            self.args.num_layers
-        ):
-            n_group, e_group, G_group = self.hyper_encoders[
-                layer_index
-            ].reasoning(
-                node_features=n_group,
-                edge_features=e_group,
-                G=G_group
-            )
-
-        # ==================================================
-        # S epistemic edge samples
-        # ==================================================
-
-        n_pair_samples = []
-        e_pair_samples = []
-
-        n_final_samples = []
-        decoder_sample_stacks = []
-
-        for sample_index in range(
-            self.num_edge_samples
-        ):
-            e_pair_s = pair_reasoning_edges[
-                :,
-                :,
-                :,
-                sample_index,
-                :
-            ]
-
-            n_pair_s = n_initial
-
-            # ==================================================
-            # Original RT reasoning
-            #
-            # ONLY:
-            # node_features
-            # sampled edge_features
-            #
-            # uncertainty 不再输入 attention
-            # ==================================================
-
-            n_pair_s, e_pair_s = self.pair_encoders[
-                0
-            ].reasoning(
-                node_features=n_pair_s,
-                edge_features=e_pair_s
-            )
-
-            for layer_index in range(
-                1,
-                self.args.num_layers
-            ):
-                n_pair_s, e_pair_s = self.pair_encoders[
-                    layer_index
-                ].reasoning(
-                    node_features=n_pair_s,
-                    edge_features=e_pair_s
-                )
-
-            n_final_s = torch.cat(
-                [
-                    n_initial,
-                    n_pair_s,
-                    n_group
-                ],
-                dim=-1
-            )
-
-            decoder_stack_s = self.run_all_decoders(
-                feature=n_final_s,
-                cur_pos=cur_pos,
-                batch_size=B,
-                num_agents=N
-            )
-
-            n_pair_samples.append(
-                n_pair_s
-            )
-
-            e_pair_samples.append(
-                e_pair_s
-            )
-
-            n_final_samples.append(
-                n_final_s
-            )
-
-            decoder_sample_stacks.append(
-                decoder_stack_s
-            )
-
-        # ==================================================
-        # Stack
-        # ==================================================
-
-        n_pair_stack = torch.stack(
-            n_pair_samples,
-            dim=2
-        )
-        # [B,N,S,D]
-
-        e_pair_stack = torch.stack(
-            e_pair_samples,
-            dim=3
-        )
-        # [B,N,N,S,D]
-
-        n_final_stack = torch.stack(
-            n_final_samples,
-            dim=2
-        )
-        # [B,N,S,3D]
-
-        out = torch.stack(
-            decoder_sample_stacks,
-            dim=2
-        )
-        # [B,N,S,K,T,2]
+        out = out.unsqueeze(2)
+        # [B,N,1,K,T,2]
 
         aux = {
+            "epi_samples": epi_samples,
+            "epi_feature_samples": epi_feature_samples,
+
+            "epi_var_heads": epi_var_heads,
+            "epi_unc_t_heads": epi_unc_t_heads,
+            "epi_unc_heads": epi_unc_heads,
+            "epi_unc_final_heads": epi_unc_final_heads,
+
+            "epi_selector_logits": epi_selector_logits,
+            "epi_selector_prob": epi_selector_prob,
+            "epi_selected_idx": epi_selected_idx,
+
+            "epi_var": epi_var,
+            "epi_unc_t": epi_unc_t,
+            "epi_unc": epi_unc,
+            "epi_unc_final": epi_unc_final,
+            "epi_unc_norm": epi_unc_norm,
+
             "n_initial": n_initial,
-
-            "e_pair_initial": e_pair_initial,
-
-            "pair_reasoning_edges": pair_reasoning_edges,
-
-            "pair_uncertainty": pair_unc_aux,
-
-            "n_pair_stack": n_pair_stack,
-
-            "e_pair_stack": e_pair_stack,
-
-            "e_group_initial": e_group_initial,
-
-            "group_matrix": group_matrix,
-
+            "n_pair": n_pair,
+            "e_pair": e_pair,
             "n_group": n_group,
-
             "e_group": e_group,
-
-            "n_final_stack": n_final_stack,
-
-            "sampled_traj": out
+            "n_final": n_final
         }
 
-        aux["edge_uncertainty"] = {
-            "sampled_edges": pair_unc_aux[
-                "sampled_edges"
-            ],
-
-            "mu_edge": pair_unc_aux[
-                "mu_edge"
-            ],
-
-            "U_e_edge": pair_unc_aux[
-                "U_e_edge"
-            ]
-        }
-
-        if return_aux:
-            return out, aux
-
-        return out
+        return (out, aux) if return_aux else out
 
 class InteractionUncertainty(nn.Module):
     def __init__(self, edge_dim, hidden_dim, dropout=0.1, sample_scale=1.0):
@@ -1608,3 +1849,22 @@ class InteractionUncertainty(nn.Module):
 
         dist["sampled_edges"] = sampled_edges
         return sampled_edges, dist
+
+class EpistemicDecoder(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        self.args = args
+        H = getattr(args, "unc_hidden_dim", getattr(args, "decoder_hidden_dim", args.hidden_dim))
+        self.dropout = getattr(args, "unc_dropout", 0.2)
+        self.fc1 = nn.Linear(args.model_dim * 3, H)
+        self.fc2 = nn.Linear(H, H)
+        self.out = nn.Linear(H, args.future_length * 2)
+
+    def forward(self, x, cur_pos=None, force_dropout=True):
+        h = F.relu(self.fc1(x))
+        h = F.dropout(h, p=self.dropout, training=self.training or force_dropout)
+        h = F.relu(self.fc2(h))
+        h = F.dropout(h, p=self.dropout, training=self.training or force_dropout)
+        out = self.out(h).view(x.size(0), x.size(1), self.args.future_length, 2)
+        if not self.args.pred_rel and cur_pos is not None: out = out + cur_pos
+        return out

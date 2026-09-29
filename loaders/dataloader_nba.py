@@ -43,5 +43,6 @@ class NBADataset(Dataset):
         past_traj = self.traj_abs[index, :, :self.obs_len, :]
         future_traj = self.traj_abs[index, :, self.obs_len:, :]
         out = [past_traj, future_traj]
-        sample_id = index + self.index_offset
-        return out, sample_id
+        # sample_id = index + self.index_offset
+        # return out, sample_id
+        return out
