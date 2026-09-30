@@ -1497,7 +1497,7 @@ class UNCERTAINMARTREASONING(nn.Module):
         self.pos_encoder = PositionalAgentEncoding(args.model_dim, 0.1, concat=True)
 
         # ==================================================
-        # Main deterministic transformer branch
+        # Main transformer
         # ==================================================
         self.pair_encoders = nn.ModuleList([
             RT(**module_args) if i == 0 else RTNoEdgeInit(**module_args)
@@ -1513,7 +1513,7 @@ class UNCERTAINMARTREASONING(nn.Module):
         ])
 
         # ==================================================
-        # Epistemic Transformer branch
+        # Epistemic transformer
         # ==================================================
         self.epi_samples = getattr(args, "epi_samples", 20)
         self.num_epi_decoders = getattr(args, "num_epi_decoders", 20)
@@ -1536,18 +1536,12 @@ class UNCERTAINMARTREASONING(nn.Module):
         ])
 
         # ==================================================
-        # 20 Epistemic Decoders
+        # Epistemic decoders
         # ==================================================
         self.epistemic_decoders = nn.ModuleList([
-            EpistemicDecoder(args) for _ in range(self.num_epi_decoders)
+            EpistemicDecoder(args)
+            for _ in range(self.num_epi_decoders)
         ])
-
-        # selector: [n_initial,n_pair,n_group] -> E heads
-        self.epi_selector = nn.Sequential(
-            nn.Linear(args.model_dim * 3, args.hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(args.hidden_dim, self.num_epi_decoders)
-        )
 
         # ==================================================
         # Main decoders
@@ -1555,7 +1549,8 @@ class UNCERTAINMARTREASONING(nn.Module):
         self.num_decoders = getattr(args, "num_decoders", args.sample_k)
         self.final_dim = args.model_dim * 3
 
-        for k in range(self.num_decoders): self.add_module(f"head_{k}", Decoder(args))
+        for k in range(self.num_decoders):
+            self.add_module(f"head_{k}", Decoder(args))
 
     def build_input(self, x_abs, x_rel):
         xs = []
@@ -1573,86 +1568,194 @@ class UNCERTAINMARTREASONING(nn.Module):
 
     def run_group_branch(self, n_initial, encoders):
         e, G = encoders[0].build_initial_group(n_initial)
-        n, e, G = encoders[0].reasoning(node_features=n_initial, edge_features=e, G=G)
+        n, e, G = encoders[0].reasoning(
+            node_features=n_initial,
+            edge_features=e,
+            G=G
+        )
+
         for i in range(1, len(encoders)):
-            n, e, G = encoders[i].reasoning(node_features=n, edge_features=e, G=G)
+            n, e, G = encoders[i].reasoning(
+                node_features=n,
+                edge_features=e,
+                G=G
+            )
+
         return n, e, G
 
     def set_mc_dropout(self, module, enabled=True):
         for m in module.modules():
-            if isinstance(m, nn.Dropout): m.train(enabled)
+            if isinstance(m, nn.Dropout):
+                m.train(enabled)
 
     def run_epistemic_transformer(self, n_initial):
-        # 即使 model.eval()，这里也强制 Transformer dropout 开启
+        # model.eval() 时也打开 epistemic transformer dropout
         self.set_mc_dropout(self.epi_pair_encoders, True)
         self.set_mc_dropout(self.epi_hyper_encoders, True)
 
-        n_pair, e_pair = self.run_pair_branch(n_initial, self.epi_pair_encoders)
-        n_group, e_group, G = self.run_group_branch(n_initial, self.epi_hyper_encoders)
+        n_pair, e_pair = self.run_pair_branch(
+            n_initial,
+            self.epi_pair_encoders
+        )
 
-        return torch.cat([n_initial, n_pair, n_group], dim=-1), n_pair, e_pair, n_group, e_group
+        n_group, e_group, G = self.run_group_branch(
+            n_initial,
+            self.epi_hyper_encoders
+        )
+
+        epi_feature = torch.cat(
+            [n_initial, n_pair, n_group],
+            dim=-1
+        )
+
+        return epi_feature, n_pair, e_pair, n_group, e_group
 
     def run_epistemic_branch(self, n_initial, cur_pos_bn):
-        # M stochastic transformer passes
-        # 每次 transformer mask 和 decoder mask 都重新采样
         all_samples, feature_samples = [], []
 
         for _ in range(self.epi_samples):
-            epi_feature, _, _, _, _ = self.run_epistemic_transformer(n_initial)
+            epi_feature, _, _, _, _ = self.run_epistemic_transformer(
+                n_initial
+            )
+
             feature_samples.append(epi_feature)
 
             head_outputs = [
-                decoder(epi_feature, cur_pos=cur_pos_bn, force_dropout=True)
+                decoder(
+                    epi_feature,
+                    cur_pos=cur_pos_bn,
+                    force_dropout=True
+                )
                 for decoder in self.epistemic_decoders
             ]
 
-            all_samples.append(torch.stack(head_outputs, dim=2))
+            all_samples.append(
+                torch.stack(head_outputs, dim=2)
+            )
             # [B,N,E,T,2]
 
         epi_samples = torch.stack(all_samples, dim=3)
         # [B,N,E,M,T,2]
 
-        epi_feature_samples = torch.stack(feature_samples, dim=2)
+        epi_feature_samples = torch.stack(
+            feature_samples,
+            dim=2
+        )
         # [B,N,M,3D]
 
         return epi_samples, epi_feature_samples
 
-    def run_all_decoders(self, feature, uncertainty, cur_pos, B, N):
+    def run_all_decoders(
+        self,
+        feature,
+        uncertainty,
+        cur_pos,
+        B,
+        N
+    ):
         feature = feature.reshape(B * N, -1)
         uncertainty = uncertainty.reshape(B * N, 1)
+
         outputs = []
 
         for k in range(self.num_decoders):
-            pred = self._modules[f"head_{k}"](feature, cur_pos, uncertainty)
-            outputs.append(pred.view(B, N, self.args.future_length, 2))
+            pred = self._modules[f"head_{k}"](
+                feature,
+                cur_pos,
+                uncertainty
+            )
+
+            outputs.append(
+                pred.view(
+                    B,
+                    N,
+                    self.args.future_length,
+                    2
+                )
+            )
 
         return torch.stack(outputs, dim=2)
 
-    def forward(self, x_abs, x_rel, return_aux=False):
+    def forward(
+        self,
+        x_abs,
+        x_rel,
+        target=None,
+        return_aux=False
+    ):
+        if target is None:
+            raise ValueError(
+                "target is required because GT is used to "
+                "select the best epistemic decoder."
+            )
+
+        if target.dim() == 5 and target.size(2) == 1:
+            target = target.squeeze(2)
+
         B, N, T_obs, _ = x_abs.shape
+        T = self.args.future_length
+        M = self.epi_samples
 
         cur_pos_bn = x_abs[:, :, -1:, :2]
-        cur_pos = cur_pos_bn.reshape(B * N, 1, 2).contiguous()
+        cur_pos = cur_pos_bn.reshape(
+            B * N,
+            1,
+            2
+        ).contiguous()
 
         # ==================================================
         # Input encoding
         # ==================================================
-        x = self.build_input(x_abs, x_rel).reshape(B * N, T_obs, -1)
+        x = self.build_input(
+            x_abs,
+            x_rel
+        ).reshape(
+            B * N,
+            T_obs,
+            -1
+        )
+
         x = self.input_fc(x)
-        x = self.pos_encoder(x, num_a=B * N)
-        x = x.reshape(B, N, T_obs, self.args.model_dim)
-        n_initial = self.input_fc2(x.reshape(B, N, T_obs * self.args.model_dim))
+        x = self.pos_encoder(
+            x,
+            num_a=B * N
+        )
+
+        x = x.reshape(
+            B,
+            N,
+            T_obs,
+            self.args.model_dim
+        )
+
+        n_initial = self.input_fc2(
+            x.reshape(
+                B,
+                N,
+                T_obs * self.args.model_dim
+            )
+        )
 
         # ==================================================
         # Main transformer
         # ==================================================
-        n_pair, e_pair = self.run_pair_branch(n_initial, self.pair_encoders)
-        n_group, e_group, G = self.run_group_branch(n_initial, self.hyper_encoders)
-        n_final = torch.cat([n_initial, n_pair, n_group], dim=-1)
+        n_pair, e_pair = self.run_pair_branch(
+            n_initial,
+            self.pair_encoders
+        )
+
+        n_group, e_group, G = self.run_group_branch(
+            n_initial,
+            self.hyper_encoders
+        )
+
+        n_final = torch.cat(
+            [n_initial, n_pair, n_group],
+            dim=-1
+        )
 
         # ==================================================
-        # Epistemic Transformer + 20 decoders
-        #
+        # Epistemic branch
         # [B,N,E,M,T,2]
         # ==================================================
         epi_samples, epi_feature_samples = self.run_epistemic_branch(
@@ -1661,58 +1764,171 @@ class UNCERTAINMARTREASONING(nn.Module):
         )
 
         # ==================================================
-        # Variance in absolute-position space
+        # Convert epistemic trajectories to absolute
         # ==================================================
-        epi_for_unc = torch.cumsum(epi_samples, dim=4) if self.args.pred_rel else epi_samples
+        if self.args.pred_rel:
+            epi_abs = (
+                torch.cumsum(
+                    epi_samples,
+                    dim=4
+                )
+                + cur_pos_bn.unsqueeze(2).unsqueeze(3)
+            )
+        else:
+            epi_abs = epi_samples
 
-        # M dimension = 3
-        epi_var_heads = epi_for_unc.var(dim=3, unbiased=False)
+        # ==================================================
+        # GT selects best epistemic decoder
+        # ==================================================
+
+        # MC mean for every epistemic decoder
+        epi_mean = epi_abs.mean(dim=3)
         # [B,N,E,T,2]
 
-        epi_unc_t_heads = torch.sqrt(
-            epi_var_heads.sum(dim=-1).clamp_min(1e-8)
+        epi_head_dist = torch.norm(
+            epi_mean - target.unsqueeze(2),
+            dim=-1
         )
         # [B,N,E,T]
 
-        epi_unc_heads = epi_unc_t_heads.mean(dim=-1)
+        epi_head_ade = epi_head_dist.mean(dim=-1)
         # [B,N,E]
 
-        epi_unc_final_heads = epi_unc_t_heads[:, :, :, -1]
-        # [B,N,E]
-
-        # ==================================================
-        # Selector
-        # inference 不使用 GT
-        # ==================================================
-        epi_selector_logits = self.epi_selector(n_final)
-        epi_selector_prob = F.softmax(epi_selector_logits, dim=-1)
-        epi_selected_idx = epi_selector_logits.argmax(dim=-1)
+        best_epi_ade, best_epi_idx = epi_head_ade.min(
+            dim=2
+        )
         # [B,N]
 
-        T = self.args.future_length
+        # ==================================================
+        # Selected MC samples
+        # ==================================================
+        idx_samples = best_epi_idx[
+            :, :, None, None, None, None
+        ].expand(
+            B,
+            N,
+            1,
+            M,
+            T,
+            2
+        )
 
-        idx_t = epi_selected_idx[:, :, None, None].expand(B, N, 1, T)
-        epi_unc_t = torch.gather(epi_unc_t_heads, 2, idx_t).squeeze(2)
-        # [B,N,T]
+        best_epi_samples = torch.gather(
+            epi_abs,
+            dim=2,
+            index=idx_samples
+        ).squeeze(2)
+        # [B,N,M,T,2]
 
-        idx_v = epi_selected_idx[:, :, None, None, None].expand(B, N, 1, T, 2)
-        epi_var = torch.gather(epi_var_heads, 2, idx_v).squeeze(2)
+        # ==================================================
+        # Selected MC-mean trajectory
+        # ==================================================
+        idx_mean = best_epi_idx[
+            :, :, None, None, None
+        ].expand(
+            B,
+            N,
+            1,
+            T,
+            2
+        )
+
+        best_epi_mean = torch.gather(
+            epi_mean,
+            dim=2,
+            index=idx_mean
+        ).squeeze(2)
         # [B,N,T,2]
 
-        epi_unc = epi_unc_t.mean(dim=-1, keepdim=True)
-        epi_unc_final = epi_unc_t[:, :, -1:]
+        # ==================================================
+        # MC variance of all heads
+        # ==================================================
+        epi_var_heads = epi_abs.var(
+            dim=3,
+            unbiased=False
+        )
+        # [B,N,E,T,2]
+
+        epi_unc_t_heads = torch.sqrt(
+            epi_var_heads.sum(
+                dim=-1
+            ).clamp_min(1e-8)
+        )
+        # [B,N,E,T]
+
+        epi_unc_heads = epi_unc_t_heads.mean(
+            dim=-1
+        )
+        # [B,N,E]
+
+        epi_unc_final_heads = epi_unc_t_heads[
+            :, :, :, -1
+        ]
+        # [B,N,E]
 
         # ==================================================
-        # Normalize uncertainty
+        # GT-best head uncertainty
         # ==================================================
-        unc_scale = epi_unc.mean().detach().clamp_min(1e-6)
-        epi_unc_norm = torch.log1p(epi_unc / unc_scale)
+        idx_t = best_epi_idx[
+            :, :, None, None
+        ].expand(
+            B,
+            N,
+            1,
+            T
+        )
 
-        # Main loss 不反向控制 uncertainty branch
+        epi_unc_t = torch.gather(
+            epi_unc_t_heads,
+            dim=2,
+            index=idx_t
+        ).squeeze(2)
+        # [B,N,T]
+
+        idx_var = best_epi_idx[
+            :, :, None, None, None
+        ].expand(
+            B,
+            N,
+            1,
+            T,
+            2
+        )
+
+        epi_var = torch.gather(
+            epi_var_heads,
+            dim=2,
+            index=idx_var
+        ).squeeze(2)
+        # [B,N,T,2]
+
+        epi_unc = epi_unc_t.mean(
+            dim=-1,
+            keepdim=True
+        )
+        # [B,N,1]
+
+        epi_unc_final = epi_unc_t[
+            :, :, -1:
+        ]
+        # [B,N,1]
+
+        # ==================================================
+        # Normalize
+        # ==================================================
+        unc_scale = epi_unc.mean().detach().clamp_min(
+            1e-6
+        )
+
+        epi_unc_norm = torch.log1p(
+            epi_unc / unc_scale
+        )
+
+        # main prediction loss does not directly optimize U
         uncertainty_for_main = epi_unc_norm.detach()
 
         # ==================================================
-        # Main 20 decoders
+        # Main decoders
         # ==================================================
         out = self.run_all_decoders(
             feature=n_final,
@@ -1728,16 +1944,22 @@ class UNCERTAINMARTREASONING(nn.Module):
 
         aux = {
             "epi_samples": epi_samples,
+            "epi_abs": epi_abs,
+            "epi_mean": epi_mean,
+
             "epi_feature_samples": epi_feature_samples,
+
+            "epi_head_ade": epi_head_ade,
+            "best_epi_idx": best_epi_idx,
+            "best_epi_ade": best_epi_ade,
+
+            "best_epi_samples": best_epi_samples,
+            "best_epi_mean": best_epi_mean,
 
             "epi_var_heads": epi_var_heads,
             "epi_unc_t_heads": epi_unc_t_heads,
             "epi_unc_heads": epi_unc_heads,
             "epi_unc_final_heads": epi_unc_final_heads,
-
-            "epi_selector_logits": epi_selector_logits,
-            "epi_selector_prob": epi_selector_prob,
-            "epi_selected_idx": epi_selected_idx,
 
             "epi_var": epi_var,
             "epi_unc_t": epi_unc_t,
@@ -1753,7 +1975,11 @@ class UNCERTAINMARTREASONING(nn.Module):
             "n_final": n_final
         }
 
-        return (out, aux) if return_aux else out
+        return (
+            (out, aux)
+            if return_aux
+            else out
+        )
 
 class InteractionUncertainty(nn.Module):
     def __init__(self, edge_dim, hidden_dim, dropout=0.1, sample_scale=1.0):

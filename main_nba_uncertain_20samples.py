@@ -16,172 +16,282 @@ from loaders.dataloader_nba import NBADataset
 import torch
 import torch.nn.functional as F
 from scipy.stats import spearmanr
-def compute_loss(y_pred, target, aux, lambda_epi=0.01, lambda_selector=0.01):
-    if target.dim() == 5 and target.size(2) == 1: target = target.squeeze(2)
+def compute_loss(
+    y_pred,
+    target,
+    aux,
+    lambda_epi=0.01
+):
+    if target.dim() == 5 and target.size(2) == 1:
+        target = target.squeeze(2)
 
+    # ==================================================
     # Main Best-of-K
+    # ==================================================
     pred = y_pred[:, :, 0]
-    dist = torch.norm(pred - target.unsqueeze(2), dim=-1)
+    # [B,N,K,T,2]
+
+    dist = torch.norm(
+        pred - target.unsqueeze(2),
+        dim=-1
+    )
+    # [B,N,K,T]
+
     ade_k = dist.mean(dim=-1)
+    # [B,N,K]
+
     best_ade = ade_k.min(dim=2)[0]
-    best_fde = dist[:, :, :, -1].min(dim=2)[0]
+
+    best_fde = dist[
+        :, :, :, -1
+    ].min(dim=2)[0]
+
     loss_main = best_ade.mean()
 
-    # Epistemic [B,N,E,M,T,2]
-    epi_pred = aux["epi_samples"]
-    B, N, E, M, T, D = epi_pred.shape
+    # ==================================================
+    # GT-best epistemic decoder
+    # ==================================================
+    best_epi_samples = aux[
+        "best_epi_samples"
+    ]
+    # [B,N,M,T,2], already absolute
 
-    # 每个 head 对 M 次 MC 取平均预测，再用 GT 选择 best head
-    epi_mean = epi_pred.mean(dim=3)
-    epi_head_ade = torch.norm(epi_mean - target.unsqueeze(2), dim=-1).mean(dim=-1)
-    best_epi_ade, best_epi_idx = epi_head_ade.min(dim=2)
-
-    # 只取 GT-best head
-    idx = best_epi_idx[:, :, None, None, None, None].expand(B, N, 1, M, T, D)
-    best_epi_samples = torch.gather(epi_pred, 2, idx).squeeze(2)
-
-    # best head 内所有 MC realization 都需要学 GT
     loss_epi = torch.norm(
-        best_epi_samples - target.unsqueeze(2),
+        best_epi_samples
+        - target.unsqueeze(2),
         dim=-1
     ).mean()
 
-    # Selector 学习预测哪个 head 是 GT-best
-    selector_logits = aux["epi_selector_logits"]
-    loss_selector = F.cross_entropy(
-        selector_logits.reshape(B * N, E),
-        best_epi_idx.detach().reshape(B * N)
+    # ==================================================
+    # Total
+    # ==================================================
+    loss = (
+        loss_main
+        + lambda_epi * loss_epi
     )
-
-    selector_acc = (
-        selector_logits.argmax(dim=-1) == best_epi_idx
-    ).float().mean()
-
-    loss = loss_main + lambda_epi * loss_epi + lambda_selector * loss_selector
 
     return loss, {
         "loss_main": loss_main.detach(),
         "loss_epi": loss_epi.detach(),
-        "loss_selector": loss_selector.detach(),
-        "selector_acc": selector_acc.detach(),
-        "best_epi_ade": best_epi_ade.mean().detach(),
+
         "best_ade": best_ade.mean().detach(),
         "best_fde": best_fde.mean().detach(),
-        "epi_unc": aux["epi_unc"].mean().detach()
-    }
 
-def train(epoch, model, optimizer, loader):
+        "best_epi_ade": aux[
+            "best_epi_ade"
+        ].mean().detach(),
+
+        "epi_unc": aux[
+            "epi_unc"
+        ].mean().detach()
+    }
+def train(
+    epoch,
+    model,
+    optimizer,
+    loader
+):
     model.train()
+
     total, counter = 0.0, 0
 
     for i, data in enumerate(loader):
         optimizer.zero_grad()
 
         x_abs, y = data
-        x_abs, y = x_abs.cuda(), y.cuda()
+
+        x_abs = x_abs.cuda()
+        y = y.cuda()
+
+        if y.dim() == 5 and y.size(2) == 1:
+            y = y.squeeze(2)
+
         B, N, _, _ = x_abs.shape
 
+        # ==================================================
+        # Relative input
+        # ==================================================
         x_rel = torch.zeros_like(x_abs)
-        x_rel[:, :, 1:] = x_abs[:, :, 1:] - x_abs[:, :, :-1]
+
+        x_rel[:, :, 1:] = (
+            x_abs[:, :, 1:]
+            - x_abs[:, :, :-1]
+        )
+
         x_rel[:, :, 0] = x_rel[:, :, 1]
 
-        y_pred, aux = model(x_abs, x_rel, return_aux=True)
+        # ==================================================
+        # Forward
+        # GT selects best epistemic decoder
+        # ==================================================
+        y_pred, aux = model(
+            x_abs,
+            x_rel,
+            target=y,
+            return_aux=True
+        )
 
+        # ==================================================
+        # Main prediction relative -> absolute
+        # ==================================================
         if opts.pred_rel:
-            cur_pos = x_abs[:, :, -1:, :2].unsqueeze(2).unsqueeze(3)
-            y_pred = torch.cumsum(y_pred, dim=4) + cur_pos
+            cur_pos = x_abs[
+                :, :, -1:, :2
+            ].unsqueeze(2).unsqueeze(3)
 
-            epi_cur_pos = x_abs[:, :, -1:, :2].unsqueeze(2).unsqueeze(3)
-            # [B,N,1,1,1,2]
-
-            aux["epi_samples"] = (
-                torch.cumsum(aux["epi_samples"], dim=4)
-                + epi_cur_pos
+            y_pred = (
+                torch.cumsum(
+                    y_pred,
+                    dim=4
+                )
+                + cur_pos
             )
 
+        # ==================================================
+        # Loss
+        # ==================================================
         loss, d = compute_loss(
             y_pred,
             y,
             aux,
-            lambda_epi=getattr(opts, "lambda_epi", 0.01),
-            lambda_selector=getattr(opts, "lambda_selector", 0.01)
+            lambda_epi=getattr(
+                opts,
+                "lambda_epi",
+                0.01
+            )
         )
 
         loss.backward()
 
         if opts.clip_grad is not None:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), opts.clip_grad)
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                opts.clip_grad
+            )
 
         optimizer.step()
 
+        # ==================================================
+        # Logging
+        # ==================================================
         w = B * N
+
         total += loss.item() * w
         counter += w
 
         if i % 100 == 0:
             print(
-                f"[TRAIN] Epoch {epoch+1}/{opts.num_epochs} | "
+                f"[TRAIN] "
+                f"Epoch {epoch+1}/{opts.num_epochs} | "
                 f"It {i+1}/{len(loader)} | "
                 f"Loss {loss.item():.4f} | "
                 f"Main {d['loss_main'].item():.4f} | "
                 f"Epi {d['loss_epi'].item():.4f} | "
-                f"Sel {d['loss_selector'].item():.4f} | "
-                f"SelAcc {d['selector_acc'].item():.3f} | "
                 f"EpiBestADE {d['best_epi_ade'].item():.4f} | "
                 f"EpiUnc {d['epi_unc'].item():.4f}"
             )
 
     return total / counter
-def test(epoch, model, loader):
+
+def test(
+    epoch,
+    model,
+    loader
+):
     model.eval()
+
     K = model.num_decoders
+    E = model.num_epi_decoders
 
     meter = {
-        "ade_1": 0., "fde_1": 0.,
-        "ade_2": 0., "fde_2": 0.,
-        "ade_3": 0., "fde_3": 0.,
-        "ade_4": 0., "fde_4": 0.,
-        "epi_ade_1": 0., "epi_fde_1": 0.,
-        "epi_ade_2": 0., "epi_fde_2": 0.,
-        "epi_ade_3": 0., "epi_fde_3": 0.,
-        "epi_ade_4": 0., "epi_fde_4": 0.,
+        "ade_1": 0.,
+        "fde_1": 0.,
+        "ade_2": 0.,
+        "fde_2": 0.,
+        "ade_3": 0.,
+        "fde_3": 0.,
+        "ade_4": 0.,
+        "fde_4": 0.,
+
+        "epi_ade_1": 0.,
+        "epi_fde_1": 0.,
+        "epi_ade_2": 0.,
+        "epi_fde_2": 0.,
+        "epi_ade_3": 0.,
+        "epi_fde_3": 0.,
+        "epi_ade_4": 0.,
+        "epi_fde_4": 0.,
+
         "counter": 0
     }
 
-    unc_ade_all, unc_fde_all = [], []
-    ade_all, fde_all = [], []
-    epi_ade_all, epi_fde_all = [], []
+    unc_ade_all = []
+    unc_fde_all = []
+
+    main_ade_all = []
+    main_fde_all = []
+
+    epi_ade_all = []
+    epi_fde_all = []
+
+    best_epi_idx_all = []
 
     with torch.no_grad():
+
         for x_abs, y in loader:
-            x_abs, y = x_abs.cuda(), y.cuda()
-            if y.dim() == 5 and y.size(2) == 1: y = y.squeeze(2)
+            x_abs = x_abs.cuda()
+            y = y.cuda()
+
+            if y.dim() == 5 and y.size(2) == 1:
+                y = y.squeeze(2)
 
             B, N, _, _ = x_abs.shape
 
+            # ==================================================
+            # Relative input
+            # ==================================================
             x_rel = torch.zeros_like(x_abs)
-            x_rel[:, :, 1:] = x_abs[:, :, 1:] - x_abs[:, :, :-1]
+
+            x_rel[:, :, 1:] = (
+                x_abs[:, :, 1:]
+                - x_abs[:, :, :-1]
+            )
+
             x_rel[:, :, 0] = x_rel[:, :, 1]
 
             # ==================================================
             # Forward
-            # selector 在 model 内部选择 epistemic head
+            # GT directly selects best epistemic decoder
             # ==================================================
-            y_pred, aux = model(x_abs, x_rel, return_aux=True)
+            y_pred, aux = model(
+                x_abs,
+                x_rel,
+                target=y,
+                return_aux=True
+            )
 
             # ==================================================
             # Main prediction -> absolute
-            # [B,N,1,K,T,2]
             # ==================================================
             if opts.pred_rel:
-                cur_pos = x_abs[:, :, -1:, :2].unsqueeze(2).unsqueeze(3)
-                y_pred = torch.cumsum(y_pred, dim=4) + cur_pos
+                cur_pos = x_abs[
+                    :, :, -1:, :2
+                ].unsqueeze(2).unsqueeze(3)
+
+                y_pred = (
+                    torch.cumsum(
+                        y_pred,
+                        dim=4
+                    )
+                    + cur_pos
+                )
 
             y_pred = y_pred[:, :, 0]
             # [B,N,K,T,2]
 
             main_dist = torch.norm(
-                y_pred - y.unsqueeze(2),
+                y_pred
+                - y.unsqueeze(2),
                 dim=-1
             )
             # [B,N,K,T]
@@ -190,41 +300,16 @@ def test(epoch, model, loader):
             w = B * N
 
             # ==================================================
-            # Epistemic branch
-            # epi_samples: [B,N,E,M,T,2]
+            # Epistemic prediction
+            # already GT-best + MC mean + absolute
             # ==================================================
-            epi_samples = aux["epi_samples"]
-
-            if opts.pred_rel:
-                epi_cur_pos = x_abs[:, :, -1:, :2].unsqueeze(2).unsqueeze(3)
-                epi_samples = torch.cumsum(epi_samples, dim=4) + epi_cur_pos
-
-            # ==================================================
-            # Selector-selected epistemic head
-            # ==================================================
-            selected_idx = aux["epi_selected_idx"]
-            # [B,N]
-
-            M = epi_samples.size(3)
-
-            idx = selected_idx[:, :, None, None, None, None].expand(
-                B, N, 1, M, T, 2
-            )
-
-            selected_epi_samples = torch.gather(
-                epi_samples,
-                dim=2,
-                index=idx
-            ).squeeze(2)
-            # [B,N,M,T,2]
-
-            # MC samples 是 epistemic samples，不做 Best-of-M
-            # 用 MC mean trajectory 计算 epistemic branch ADE/FDE
-            selected_epi_mean = selected_epi_samples.mean(dim=2)
+            best_epi_mean = aux[
+                "best_epi_mean"
+            ]
             # [B,N,T,2]
 
             epi_dist = torch.norm(
-                selected_epi_mean - y,
+                best_epi_mean - y,
                 dim=-1
             )
             # [B,N,T]
@@ -238,93 +323,185 @@ def test(epoch, model, loader):
                 ("3", min(15, T)),
                 ("4", T)
             ]:
-                # ---------------- Main Best-of-K ----------------
-                main_ade_k = main_dist[:, :, :, :end].mean(dim=3)
-                main_fde_k = main_dist[:, :, :, end - 1]
 
-                best_main_ade = main_ade_k.min(dim=2)[0]
-                best_main_fde = main_fde_k.min(dim=2)[0]
+                # ------------------------------------------
+                # Main Best-of-K
+                # ------------------------------------------
+                main_ade_k = main_dist[
+                    :, :, :, :end
+                ].mean(dim=3)
 
-                meter[f"ade_{key}"] += best_main_ade.mean().item() * w
-                meter[f"fde_{key}"] += best_main_fde.mean().item() * w
+                main_fde_k = main_dist[
+                    :, :, :, end - 1
+                ]
 
-                # ---------------- Selector Epi ----------------
-                epi_ade = epi_dist[:, :, :end].mean(dim=2)
-                epi_fde = epi_dist[:, :, end - 1]
+                best_main_ade = main_ade_k.min(
+                    dim=2
+                )[0]
 
-                meter[f"epi_ade_{key}"] += epi_ade.mean().item() * w
-                meter[f"epi_fde_{key}"] += epi_fde.mean().item() * w
+                best_main_fde = main_fde_k.min(
+                    dim=2
+                )[0]
+
+                meter[
+                    f"ade_{key}"
+                ] += (
+                    best_main_ade.mean().item()
+                    * w
+                )
+
+                meter[
+                    f"fde_{key}"
+                ] += (
+                    best_main_fde.mean().item()
+                    * w
+                )
+
+                # ------------------------------------------
+                # GT-best epistemic decoder
+                # MC mean trajectory
+                # ------------------------------------------
+                epi_ade = epi_dist[
+                    :, :, :end
+                ].mean(dim=2)
+
+                epi_fde = epi_dist[
+                    :, :, end - 1
+                ]
+
+                meter[
+                    f"epi_ade_{key}"
+                ] += (
+                    epi_ade.mean().item()
+                    * w
+                )
+
+                meter[
+                    f"epi_fde_{key}"
+                ] += (
+                    epi_fde.mean().item()
+                    * w
+                )
 
                 if key == "4":
-                    ade_agent = best_main_ade
-                    fde_agent = best_main_fde
+                    main_ade_agent = best_main_ade
+                    main_fde_agent = best_main_fde
+
                     epi_ade_agent = epi_ade
                     epi_fde_agent = epi_fde
 
             # ==================================================
             # Uncertainty
-            # aux["epi_unc"] 本身已经是 selector-selected head uncertainty
+            # GT-best head's MC variance
             # ==================================================
             unc_ade_all.append(
-                aux["epi_unc"].reshape(-1).cpu().numpy()
+                aux["epi_unc"]
+                .reshape(-1)
+                .cpu()
+                .numpy()
             )
 
             unc_fde_all.append(
-                aux["epi_unc_final"].reshape(-1).cpu().numpy()
+                aux["epi_unc_final"]
+                .reshape(-1)
+                .cpu()
+                .numpy()
             )
 
-            ade_all.append(
-                ade_agent.reshape(-1).cpu().numpy()
+            # ==================================================
+            # Errors
+            # ==================================================
+            main_ade_all.append(
+                main_ade_agent
+                .reshape(-1)
+                .cpu()
+                .numpy()
             )
 
-            fde_all.append(
-                fde_agent.reshape(-1).cpu().numpy()
+            main_fde_all.append(
+                main_fde_agent
+                .reshape(-1)
+                .cpu()
+                .numpy()
             )
 
             epi_ade_all.append(
-                epi_ade_agent.reshape(-1).cpu().numpy()
+                epi_ade_agent
+                .reshape(-1)
+                .cpu()
+                .numpy()
             )
 
             epi_fde_all.append(
-                epi_fde_agent.reshape(-1).cpu().numpy()
+                epi_fde_agent
+                .reshape(-1)
+                .cpu()
+                .numpy()
+            )
+
+            best_epi_idx_all.append(
+                aux["best_epi_idx"]
+                .reshape(-1)
+                .cpu()
+                .numpy()
             )
 
             meter["counter"] += w
 
     # ==================================================
-    # Average metrics
+    # Average results
     # ==================================================
     c = meter["counter"]
+
     results = {
         k: meter[k] / c
         for k in meter
         if k != "counter"
     }
 
-    unc_ade_all = np.concatenate(unc_ade_all)
-    unc_fde_all = np.concatenate(unc_fde_all)
+    unc_ade_all = np.concatenate(
+        unc_ade_all
+    )
 
-    ade_all = np.concatenate(ade_all)
-    fde_all = np.concatenate(fde_all)
+    unc_fde_all = np.concatenate(
+        unc_fde_all
+    )
 
-    epi_ade_all = np.concatenate(epi_ade_all)
-    epi_fde_all = np.concatenate(epi_fde_all)
+    main_ade_all = np.concatenate(
+        main_ade_all
+    )
+
+    main_fde_all = np.concatenate(
+        main_fde_all
+    )
+
+    epi_ade_all = np.concatenate(
+        epi_ade_all
+    )
+
+    epi_fde_all = np.concatenate(
+        epi_fde_all
+    )
+
+    best_epi_idx_all = np.concatenate(
+        best_epi_idx_all
+    )
 
     # ==================================================
-    # Uncertainty vs MAIN error
+    # Spearman: uncertainty vs main error
     # ==================================================
-    rho_ade, p_ade = spearmanr(
+    rho_main_ade, p_main_ade = spearmanr(
         unc_ade_all,
-        ade_all
+        main_ade_all
     )
 
-    rho_fde, p_fde = spearmanr(
+    rho_main_fde, p_main_fde = spearmanr(
         unc_fde_all,
-        fde_all
+        main_fde_all
     )
 
     # ==================================================
-    # Uncertainty vs EPISTEMIC branch error
+    # Spearman: uncertainty vs epistemic error
     # ==================================================
     rho_epi_ade, p_epi_ade = spearmanr(
         unc_ade_all,
@@ -339,16 +516,16 @@ def test(epoch, model, loader):
     # ==================================================
     # Bins
     # ==================================================
-    bins_ade = compute_uncertainty_bins(
+    bins_main_ade = compute_uncertainty_bins(
         unc_ade_all,
-        ade_all,
+        main_ade_all,
         "MAIN-ADE",
         5
     )
 
-    bins_fde = compute_uncertainty_bins(
+    bins_main_fde = compute_uncertainty_bins(
         unc_fde_all,
-        fde_all,
+        main_fde_all,
         "MAIN-FDE",
         5
     )
@@ -368,12 +545,38 @@ def test(epoch, model, loader):
     )
 
     # ==================================================
+    # Head usage
+    # ==================================================
+    head_counts = np.bincount(
+        best_epi_idx_all,
+        minlength=E
+    )
+
+    head_ratio = (
+        head_counts
+        / max(
+            head_counts.sum(),
+            1
+        )
+    )
+
+    # ==================================================
     # Print
     # ==================================================
-    print(f"\n{'=' * 70}")
-    print(f"[{loader.dataset.mode.upper()}] Epoch {epoch}")
+    print(
+        f"\n{'=' * 70}"
+    )
 
-    print(f"\n[MAIN BEST-OF-{K}]")
+    print(
+        f"[{loader.dataset.mode.upper()}] "
+        f"Epoch {epoch}"
+    )
+
+    # ---------------- Main ----------------
+    print(
+        f"\n[MAIN BEST-OF-{K}]"
+    )
+
     for t in range(1, 5):
         print(
             f"{t}.0s: "
@@ -381,9 +584,10 @@ def test(epoch, model, loader):
             f"{results[f'fde_{t}']:.3f}"
         )
 
+    # ---------------- Epistemic ----------------
     print(
-        f"\n[SELECTOR EPISTEMIC DECODER | "
-        f"E={model.num_epi_decoders} | "
+        f"\n[GT-BEST EPISTEMIC DECODER | "
+        f"E={E} | "
         f"MC={model.epi_samples}]"
     )
 
@@ -394,43 +598,103 @@ def test(epoch, model, loader):
             f"{results[f'epi_fde_{t}']:.3f}"
         )
 
-    print(f"\nMean EpiUnc: {unc_ade_all.mean():.6f}")
+    # ---------------- Uncertainty ----------------
+    print(
+        f"\nMean EpiUnc: "
+        f"{unc_ade_all.mean():.6f}"
+    )
 
-    print(f"\n[UNCERTAINTY vs MAIN]")
+    print(
+        f"Mean EpiFinalUnc: "
+        f"{unc_fde_all.mean():.6f}"
+    )
+
+    print(
+        "\n[UNCERTAINTY vs MAIN ERROR]"
+    )
+
     print(
         f"Spearman(EpiUncMean, MainADE): "
-        f"{rho_ade:.6f} (p={p_ade:.3e})"
+        f"{rho_main_ade:.6f} "
+        f"(p={p_main_ade:.3e})"
     )
+
     print(
         f"Spearman(EpiUncFinal, MainFDE): "
-        f"{rho_fde:.6f} (p={p_fde:.3e})"
+        f"{rho_main_fde:.6f} "
+        f"(p={p_main_fde:.3e})"
     )
 
-    print(f"\n[UNCERTAINTY vs EPISTEMIC BRANCH]")
+    print(
+        "\n[UNCERTAINTY vs EPISTEMIC ERROR]"
+    )
+
     print(
         f"Spearman(EpiUncMean, EpiADE): "
-        f"{rho_epi_ade:.6f} (p={p_epi_ade:.3e})"
+        f"{rho_epi_ade:.6f} "
+        f"(p={p_epi_ade:.3e})"
     )
+
     print(
         f"Spearman(EpiUncFinal, EpiFDE): "
-        f"{rho_epi_fde:.6f} (p={p_epi_fde:.3e})"
+        f"{rho_epi_fde:.6f} "
+        f"(p={p_epi_fde:.3e})"
     )
 
-    print("=" * 70)
+    # ==================================================
+    # Head usage
+    # ==================================================
+    print(
+        "\n[GT-BEST EPISTEMIC HEAD USAGE]"
+    )
+
+    for e in range(E):
+        print(
+            f"Head {e:02d} | "
+            f"N={head_counts[e]:6d} | "
+            f"Ratio={head_ratio[e]:.4f}"
+        )
+
+    print(
+        "=" * 70
+    )
 
     # ==================================================
-    # Save results
+    # Store results
     # ==================================================
-    results["spearman_ade"] = float(rho_ade)
-    results["spearman_fde"] = float(rho_fde)
+    results["spearman_main_ade"] = float(
+        rho_main_ade
+    )
 
-    results["spearman_epi_ade"] = float(rho_epi_ade)
-    results["spearman_epi_fde"] = float(rho_epi_fde)
+    results["spearman_main_fde"] = float(
+        rho_main_fde
+    )
 
-    results["bins_ade"] = bins_ade
-    results["bins_fde"] = bins_fde
+    results["spearman_epi_ade"] = float(
+        rho_epi_ade
+    )
+
+    results["spearman_epi_fde"] = float(
+        rho_epi_fde
+    )
+
+    # 保留旧接口
+    results["spearman_ade"] = float(
+        rho_main_ade
+    )
+
+    results["spearman_fde"] = float(
+        rho_main_fde
+    )
+
+    results["bins_main_ade"] = bins_main_ade
+    results["bins_main_fde"] = bins_main_fde
+
     results["bins_epi_ade"] = bins_epi_ade
     results["bins_epi_fde"] = bins_epi_fde
+
+    results["head_counts"] = head_counts.tolist()
+    results["head_ratio"] = head_ratio.tolist()
 
     return results
 
